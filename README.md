@@ -54,7 +54,7 @@ Large files transfer service for the modern world.
 
 ## Phase 1
 - Single stream QUIC file transfer -- client and server
-- BBR-like CC
+- [BBRv2](https://docs.rs/quiche/latest/quiche/enum.CongestionControlAlgorithm.html)
 - Content-defined chunking and Merkle manifest, and end-to-end hashing
 - Resumable transfer
 
@@ -64,7 +64,7 @@ Large files transfer service for the modern world.
 - ECN, app-level multi-path stripping
 - Priority queues
 - Per-tenant fainess control
-- HTTP/3/MASQUE tunneling (for enterprise firewalls)
+- HTTP/3/MASQUE tunnelling (for enterprise firewalls)
 
 ## Phase 3
 - Multi-path QUIC transfer
