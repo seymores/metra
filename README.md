@@ -23,6 +23,7 @@ Large files transfer service for the modern world.
   - Priority lanes
   - Business-hour caps or conservative window hours
   - Floor/Ceiling/Mas burst configuration for transfer, queue -- by user or tenant.
+- BBRv2 by default (Bottleneck Bandwidth and Round-trip propagation time)
 
 # Performance Mechanism
 - Lower queuing = higher goodput under mixed traffic via model-based CC (Aspera’s classic rate shaper + loss heuristics tends to fill queues).
@@ -31,6 +32,7 @@ Large files transfer service for the modern world.
 - QUIC migration + resume makes mobile/ISP NAT changes almost invisible.
 - Content-defined chunking enables delta-sync & instant resume without re-seeding byte offsets; Aspera’s resume is offset-oriented.
 - ACK decimation & ECN protect the reverse path (a common hidden bottleneck that slows legacy UDP senders).
+- Fallback to TCP/IP
 
 # Test Cases
 1. 100GB file, 120ms RTTT, 0.5% random loss, 9Gbps+, p95 CPU -- assume 5Gpbs
