@@ -1,73 +1,133 @@
-# Metra Transfer Protocol
-Large files transfer service for the modern world.
+# Metra
 
-# Metrics
-- Multi-GB/TB transfer over the open Internet, faster than Aspera standard transfer
-- Co-tenants
-- Resistant to loss/jitter and NATS
-- Consider high-BDP links -- 1-40Gps, < 200ms RTT at < 2% loss
--  90%+ provisioned bandwidth at < 0.5% loss
-- Resumable, less than 1s on network blips and no slow start or stalls control
-- Black-box KPIs: time-to-first-byte, time-to-verify, p50/p95 throughput, resume counts, reverse-path RTT.
+Open-source (Apache-2.0) large-file transfer platform designed to rival Aspera using a QUIC-first data plane and REST control plane.
 
-# Foundation
-- [QUIC - RFC9000](https://datatracker.ietf.org/doc/html/rfc9000) -- solves TLS (1.3 builtin), NAT-friendly, connection migration, multiplexing, ACK ranges and packet number spacing
-  - Control = one reliable QUIC stream (session, manifests, policy, telemetry).
-  - Data = many parallel QUIC streams, OR DATAGRAM frames
-- Reliability
-  - Chunk-level recovery: Let the app layer re-request missing chunks by ID (not byte offsets) to avoid head-of-line traps and exploit caches.
-  - ACK decimation / ACK-frequency to protect the reverse path on high-rate links.
-  - Selective retransmit (NACK/ACK ranges) for rare loss.
-  - Adaptive systematic FEC (e.g., RaptorQ/RLNC) across stripes when loss/jitter rises. Start at 0–3% overhead, auto-tune to loss & RTT variance.
-- Rate Shaping % Fairness control
-  - Priority lanes
-  - Business-hour caps or conservative window hours
-  - Floor/Ceiling/Mas burst configuration for transfer, queue -- by user or tenant.
-- BBRv2 by default (Bottleneck Bandwidth and Round-trip propagation time)
+## Current Vertical Slice
 
-# Performance Mechanism
-- Lower queuing = higher goodput under mixed traffic via model-based CC (Aspera’s classic rate shaper + loss heuristics tends to fill queues).
-- Loss-masking FEC reduces retransmission stalls on 0.3–2% loss paths (satellite, Wi-Fi mesh), where pure NACK/ARQ thrashes.
-- Parallel streams + chunk scheduling avoid head-of-line better than monolithic flows.
-- QUIC migration + resume makes mobile/ISP NAT changes almost invisible.
-- Content-defined chunking enables delta-sync & instant resume without re-seeding byte offsets; Aspera’s resume is offset-oriented.
-- ACK decimation & ECN protect the reverse path (a common hidden bottleneck that slows legacy UDP senders).
-- Fallback to TCP/IP
+- Rust workspace with three crates:
+  - `metra-proto`: shared API and transfer models.
+  - `metra-server`: REST control plane + QUIC upload receiver.
+  - `metra-client`: TUI-first client with scriptable CLI commands and QUIC sender.
+- REST endpoints:
+  - `GET /health`
+  - `GET /v1/quic/certificate`
+  - `POST /v1/transfers`
+  - `GET /v1/transfers/{transfer_id}`
+- v1 transfer request validation includes 1 MiB resume chunk sizing.
+- OpenTelemetry-enabled tracing pipeline initialized in server.
+- Resumable upload path:
+  - client sends QUIC transfer-open control frame
+  - server replies with resume offset based on staged bytes
+  - client streams remaining bytes only
 
-# Test Cases
-1. 100GB file, 120ms RTTT, 0.5% random loss, 9Gbps+, p95 CPU -- assume 5Gpbs
+## Architecture Direction
 
-# Notes
+- Control plane: REST.
+- Data plane: custom QUIC protocol.
+- Browser path: Chrome extension/web app -> localhost helper -> QUIC server.
+- Browser fallback: plugin-free HTTP/3/WebTransport path for constrained environments.
+- Multi-tenant model with per-user transfer metering.
 
-## Network tuning
-- SO_RCVBUF/SO_SNDBUF to tens of MB; raise rmem_max/wmem_max.
-- Enable GSO/GRO for UDP; CPU pinning for RX/TX queues; IRQ affinity; NIC coalescing tuned to pacer.
-- Busy-polling (carefully) and io_uring SQPOLL for user-space stacks.
-- Checksum offload and hardware crypto (AES-NI/ARMv8) detection at startup.
+## Quick Start
 
-## Dev
-- Zero-copy / low-copy pipeline: io_uring + sendmmsg/recvmmsg, fixed buffers, hugepages.
-- S3/GCS “native”: multi-part, parallel PUT/GET; checksum parity with cloud ETags to avoid double hashing.
-- Per-chunk BLAKE3 hash; Merkle tree root for whole-file integrity; supports concurrent verification & early finalize.
+### 1) Build
 
-# MVP Plan
+```bash
+cargo build
+```
 
-## Phase 1
-- Single stream QUIC file transfer -- client and server
-- [BBRv2](https://docs.rs/quiche/latest/quiche/enum.CongestionControlAlgorithm.html)
-- Content-defined chunking and Merkle manifest, and end-to-end hashing
-- Resumable transfer
+### 2) Run Server (release mode recommended for throughput)
 
-## Phase 2
-- Adaptive FEC
-- ACK-frequency control
-- ECN, app-level multi-path stripping
-- Priority queues
-- Per-tenant fainess control
-- HTTP/3/MASQUE tunnelling (for enterprise firewalls)
+```bash
+cargo run --release -p metra-server -- \
+  --rest-addr 127.0.0.1:8080 \
+  --quic-addr 127.0.0.1:8443 \
+  --data-dir /Users/ping/Projects/metra/var/data
+```
 
-## Phase 3
-- Multi-path QUIC transfer
-- Edge storage-promximate service -- auto-scaling
-- WAN selection policy
-- cross-region relay optimisation with CDN-like POP nodes
+### 3) Check Health (CLI)
+
+```bash
+cargo run -p metra-client -- health --output json
+```
+
+### 4) Launch TUI
+
+```bash
+cargo run -p metra-client -- tui
+```
+
+### 5) Create Transfer (scriptable CLI)
+
+```bash
+cargo run --release -p metra-client -- transfer create \
+  --tenant-id tenant-a \
+  --user-id user-a \
+  --source-uri file:///tmp/input.bin \
+  --destination-uri s3://bucket/output.bin \
+  --file-name input.bin \
+  --file-size-bytes 322122547200 \
+  --overwrite
+```
+
+### 6) Send File Data over QUIC
+
+```bash
+cargo run --release -p metra-client -- --output json transfer send \
+  --transfer-id <UUID_FROM_CREATE> \
+  --file-path /tmp/input.bin \
+  --io-chunk-bytes 16777216
+```
+
+### 7) Query Transfer Status
+
+```bash
+cargo run --release -p metra-client -- transfer status --transfer-id <UUID>
+```
+
+## Big File Benchmarking
+
+Run an end-to-end benchmark (creates sparse test file, creates transfer, sends file, prints throughput):
+
+```bash
+cargo run --release -p metra-client -- --output json transfer bench \
+  --size-gib 2 \
+  --file-path /tmp/metra-bench-2g.bin \
+  --io-chunk-bytes 16777216
+```
+
+## Resume Validation
+
+1) Start a large send and interrupt it (`Ctrl+C`).
+2) Re-run the same `transfer send` command with the same `transfer_id`.
+3) Confirm `resumed_from_bytes` in output is non-zero.
+
+## Measured Local Baseline (This Machine)
+
+- Debug client + debug server (1 GiB): ~0.47 Gbps.
+- Release client + debug server (1 GiB): ~0.56 Gbps.
+- Release client + release server (2 GiB, 16 MiB chunks): ~0.86 Gbps.
+- Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
+
+These measurements are local environment baselines and do not represent target WAN/DC performance.
+
+## Current Limitations
+
+- Single-stream file data path (multi-stream striping not implemented yet).
+- Disk-backed local storage path only for data plane write target.
+- No FEC, no multi-path QUIC, no congestion-controller tuning profiles yet.
+- Browser helper and extension are still pending implementation.
+
+## Next Tuning Work
+
+- Multi-stream striping per transfer (N parallel QUIC streams).
+- Pinned runtime threads and larger ring buffers for sender/receiver.
+- Direct I/O and async file batching for lower write amplification.
+- Transfer workers with per-tenant rate/fairness policies.
+- WAN impairment tests with `tc/netem` and p95/p99 throughput reporting.
+
+## Notes
+
+- This is a first implementation slice to establish API, runtime structure, and client workflows.
+- QUIC session acceptance is implemented; full chunk scheduling, resumable data streaming, FEC, and storage backends are next.
+- Requirements baseline is tracked in `REQUIREMENTS.md`.
