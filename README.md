@@ -93,7 +93,8 @@ Run an end-to-end benchmark (creates sparse test file, creates transfer, sends f
 cargo run --release -p metra-client -- --output json transfer bench \
   --size-gib 2 \
   --file-path /tmp/metra-bench-2g.bin \
-  --io-chunk-bytes 16777216
+  --io-chunk-bytes 16777216 \
+  --lanes 4
 ```
 
 ## Resume Validation
@@ -107,24 +108,47 @@ cargo run --release -p metra-client -- --output json transfer bench \
 - Debug client + debug server (1 GiB): ~0.47 Gbps.
 - Release client + debug server (1 GiB): ~0.56 Gbps.
 - Release client + release server (2 GiB, 16 MiB chunks): ~0.86 Gbps.
+- Release client + release server (4 GiB, 4 lanes): ~1.23 Gbps.
+- Release client + release server (16 GiB, 4 lanes): ~1.21 Gbps.
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 
 These measurements are local environment baselines and do not represent target WAN/DC performance.
 
 ## Current Limitations
 
-- Single-stream file data path (multi-stream striping not implemented yet).
+- Multi-lane transfer is currently an early implementation and still needs hardening.
 - Disk-backed local storage path only for data plane write target.
+- Resume semantics are complete for single-lane mode; striped resume is not complete.
 - No FEC, no multi-path QUIC, no congestion-controller tuning profiles yet.
 - Browser helper and extension are still pending implementation.
 
-## Next Tuning Work
+## TODO and Plan
 
-- Multi-stream striping per transfer (N parallel QUIC streams).
-- Pinned runtime threads and larger ring buffers for sender/receiver.
-- Direct I/O and async file batching for lower write amplification.
-- Transfer workers with per-tenant rate/fairness policies.
-- WAN impairment tests with `tc/netem` and p95/p99 throughput reporting.
+### Immediate (Current Iteration)
+
+- [x] Refactor server/client monolith files into smaller modules.
+- [x] Add multi-lane transfer support (`--lanes`) for parallel QUIC streams.
+- [ ] Validate and tune lane scheduling for higher throughput under load.
+- [ ] Add automated benchmark matrix for lane/chunk combinations.
+
+### Near-term Performance Roadmap
+
+- [ ] Implement bounded pipeline stages for read/encrypt-send/receive-write.
+- [ ] Add per-lane and aggregate throughput metrics via OpenTelemetry.
+- [ ] Add CPU and runtime tuning profile (thread affinity, buffer sizing).
+- [ ] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.
+
+### Reliability and Data Integrity
+
+- [ ] Add robust resume for striped multi-lane transfers.
+- [ ] Add per-chunk hash verification and end-of-transfer integrity checks.
+- [ ] Add failure recovery tests (connection drop, lane loss, restart).
+
+### Product Features After Core Throughput
+
+- [ ] Implement browser helper + Chrome extension path.
+- [ ] Add S3-compatible data path integration.
+- [ ] Add multi-tenant fairness and transfer policies.
 
 ## Notes
 

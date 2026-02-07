@@ -79,6 +79,8 @@ pub struct SendArgs {
     pub io_chunk_bytes: usize,
     #[arg(long, default_value_t = 1)]
     pub progress_interval_secs: u64,
+    #[arg(long, default_value_t = 1)]
+    pub lanes: u32,
 }
 
 #[derive(Debug, clap::Args)]
@@ -97,4 +99,6 @@ pub struct BenchArgs {
     pub quic_addr: Option<SocketAddr>,
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     pub io_chunk_bytes: usize,
+    #[arg(long, default_value_t = 1)]
+    pub lanes: u32,
 }

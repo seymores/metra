@@ -85,6 +85,14 @@ pub struct QuicTransferOpen {
     pub file_size_bytes: u64,
     pub file_name: String,
     pub resume_chunk_size_bytes: u64,
+    #[serde(default)]
+    pub lane_index: u32,
+    #[serde(default = "default_total_lanes")]
+    pub total_lanes: u32,
+    #[serde(default)]
+    pub range_start: u64,
+    #[serde(default)]
+    pub range_end_exclusive: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,4 +143,8 @@ impl CreateTransferRequest {
 
 fn default_resume_chunk_size() -> u64 {
     RESUME_CHUNK_SIZE_BYTES
+}
+
+fn default_total_lanes() -> u32 {
+    1
 }

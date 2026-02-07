@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use metra_proto::TransferSummary;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -11,6 +11,7 @@ pub struct AppState {
     pub data_dir: Arc<PathBuf>,
     pub quic_server_name: Arc<String>,
     pub quic_cert_der_b64: Arc<String>,
+    pub finalize_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -26,6 +27,7 @@ impl AppState {
             data_dir: Arc::new(data_dir),
             quic_server_name: Arc::new(quic_server_name),
             quic_cert_der_b64: Arc::new(quic_cert_der_b64),
+            finalize_lock: Arc::new(Mutex::new(())),
         }
     }
 }
