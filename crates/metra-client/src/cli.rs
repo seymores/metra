@@ -151,6 +151,10 @@ pub struct BenchArgs {
     pub auto_lanes_report: Option<PathBuf>,
     #[arg(long)]
     pub lane_policy: Option<PathBuf>,
+    #[arg(long)]
+    pub auto_runtime_report: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub runtime_profile: Option<RuntimeProfile>,
     #[arg(long)]
@@ -187,6 +191,10 @@ pub struct MatrixArgs {
     pub auto_lanes_report: Option<PathBuf>,
     #[arg(long)]
     pub lane_policy: Option<PathBuf>,
+    #[arg(long)]
+    pub auto_runtime_report: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub runtime_profile: Option<RuntimeProfile>,
     #[arg(long)]
@@ -239,6 +247,8 @@ pub struct TuneRuntimeArgs {
     pub cleanup_file: bool,
     #[arg(long)]
     pub json_out: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy_out: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]

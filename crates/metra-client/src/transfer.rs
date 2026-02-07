@@ -36,6 +36,10 @@ use crate::{
     },
     quic::{connect_quic, read_json_frame, write_json_frame},
     rest::{create_transfer, fetch_health, fetch_quic_certificate, fetch_transfer_status},
+    runtime_policy::{
+        RuntimePolicyEntry, RuntimeWorkloadProfile, read_runtime_policy, select_runtime_policy,
+        upsert_runtime_policy_entry,
+    },
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,20 +197,22 @@ pub struct TuneLanesRun {
     errors: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TuneRuntimeReport {
     server: String,
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     size_gib: u64,
     lanes: u32,
+    #[serde(default = "default_tune_runtime_io_chunk_bytes")]
+    io_chunk_bytes: usize,
     iterations: u32,
     no_disk: bool,
     recommended_profile: Option<String>,
     profiles: Vec<TuneRuntimeProfileResult>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TuneRuntimeProfileResult {
     runtime_profile: String,
     effective_io_chunk_bytes: Option<usize>,
@@ -218,7 +224,7 @@ pub struct TuneRuntimeProfileResult {
     runs: Vec<TuneRuntimeRun>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TuneRuntimeRun {
     iteration: u32,
     transfer_id: Option<Uuid>,
@@ -322,6 +328,10 @@ struct LaneTransferResult {
 
 const DEFAULT_IO_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_FILE_READ_PIPELINE_DEPTH: usize = 4;
+
+fn default_tune_runtime_io_chunk_bytes() -> usize {
+    DEFAULT_IO_CHUNK_BYTES
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RuntimePreset {
@@ -519,6 +529,8 @@ pub async fn run_benchmark_matrix(
                     no_disk: args.no_disk,
                     auto_lanes_report: args.auto_lanes_report.clone(),
                     lane_policy: args.lane_policy.clone(),
+                    auto_runtime_report: args.auto_runtime_report.clone(),
+                    runtime_policy: args.runtime_policy.clone(),
                     runtime_profile: args.runtime_profile,
                     file_read_pipeline_depth: args.file_read_pipeline_depth,
                 };
@@ -735,6 +747,8 @@ pub async fn run_benchmark_compare(
             no_disk: false,
             auto_lanes_report: None,
             lane_policy: None,
+            auto_runtime_report: None,
+            runtime_policy: None,
             runtime_profile: None,
             file_read_pipeline_depth: None,
         };
@@ -753,6 +767,8 @@ pub async fn run_benchmark_compare(
             no_disk: true,
             auto_lanes_report: None,
             lane_policy: None,
+            auto_runtime_report: None,
+            runtime_policy: None,
             runtime_profile: None,
             file_read_pipeline_depth: None,
         };
@@ -1047,6 +1063,7 @@ pub async fn run_tune_lanes_under_load(
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                 });
@@ -1226,6 +1243,8 @@ pub async fn run_tune_runtime_profiles(
                 no_disk: args.no_disk,
                 auto_lanes_report: None,
                 lane_policy: None,
+                auto_runtime_report: None,
+                runtime_policy: None,
                 runtime_profile: Some(profile),
                 file_read_pipeline_depth: args.file_read_pipeline_depth,
             };
@@ -1291,6 +1310,7 @@ pub async fn run_tune_runtime_profiles(
         completed_at: Utc::now(),
         size_gib: args.size_gib,
         lanes: args.lanes,
+        io_chunk_bytes: args.io_chunk_bytes,
         iterations: args.iterations,
         no_disk: args.no_disk,
         recommended_profile: profile_results
@@ -1306,6 +1326,9 @@ pub async fn run_tune_runtime_profiles(
     };
     if let Some(path) = args.json_out.as_ref() {
         write_json_file(path, &report).await?;
+    }
+    if let Some(path) = args.runtime_policy_out.as_ref() {
+        persist_tune_runtime_policy(path, args.json_out.as_deref(), &report).await?;
     }
     Ok(report)
 }
@@ -1357,6 +1380,60 @@ async fn persist_tune_lanes_policy(
             .unwrap_or(0.0),
     };
     upsert_lane_policy_entry(policy_path, entry).await
+}
+
+async fn persist_tune_runtime_policy(
+    policy_path: &Path,
+    json_out: Option<&Path>,
+    report: &TuneRuntimeReport,
+) -> Result<()> {
+    let recommended_profile = report
+        .recommended_profile
+        .as_ref()
+        .context("cannot persist runtime policy: tune-runtime report has no recommended profile")?;
+    let selected = report
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile
+                .runtime_profile
+                .eq_ignore_ascii_case(recommended_profile)
+        })
+        .context("cannot persist runtime policy: recommended profile not found in report rows")?;
+    let effective_io_chunk_bytes = selected
+        .effective_io_chunk_bytes
+        .context("cannot persist runtime policy: effective_io_chunk_bytes is missing")?;
+    let file_read_pipeline_depth = selected
+        .file_read_pipeline_depth
+        .context("cannot persist runtime policy: file_read_pipeline_depth is missing")?;
+
+    let entry = RuntimePolicyEntry {
+        profile: RuntimeWorkloadProfile {
+            size_gib: report.size_gib,
+            lanes: report.lanes,
+            io_chunk_bytes: report.io_chunk_bytes,
+            no_disk: report.no_disk,
+        },
+        recommended_profile: selected.runtime_profile.clone(),
+        effective_io_chunk_bytes,
+        file_read_pipeline_depth,
+        source: json_out
+            .map(|path| format!("tune-runtime report {}", path.display()))
+            .unwrap_or_else(|| "transfer tune-runtime".to_owned()),
+        tuned_at: report.completed_at,
+        throughput_p50_gbps: selected.throughput_gbps.p50,
+        throughput_p95_gbps: selected.throughput_gbps.p95,
+    };
+    upsert_runtime_policy_entry(policy_path, entry).await
+}
+
+fn parse_runtime_profile(value: &str) -> Option<RuntimeProfile> {
+    match value.to_ascii_lowercase().as_str() {
+        "balanced" => Some(RuntimeProfile::Balanced),
+        "throughput" => Some(RuntimeProfile::Throughput),
+        "low-cpu" => Some(RuntimeProfile::LowCpu),
+        _ => None,
+    }
 }
 
 async fn resolve_benchmark_lanes(
@@ -1436,6 +1513,98 @@ async fn resolve_benchmark_lanes(
     Ok((configured_lanes, None))
 }
 
+async fn resolve_benchmark_runtime_profile(
+    configured_runtime_profile: Option<RuntimeProfile>,
+    auto_runtime_report: Option<&Path>,
+    runtime_policy_path: Option<&Path>,
+    requested_profile: &RuntimeWorkloadProfile,
+) -> Result<(Option<RuntimeProfile>, Option<String>)> {
+    if let Some(runtime_profile) = configured_runtime_profile {
+        return Ok((Some(runtime_profile), None));
+    }
+
+    if let Some(report_path) = auto_runtime_report {
+        let payload = fs::read(report_path).await.with_context(|| {
+            format!(
+                "failed reading auto runtime report {}",
+                report_path.display()
+            )
+        })?;
+        let report = serde_json::from_slice::<TuneRuntimeReport>(&payload).with_context(|| {
+            format!(
+                "failed parsing auto runtime report JSON {}",
+                report_path.display()
+            )
+        })?;
+
+        if let Some(recommended) = report.recommended_profile.as_ref() {
+            let runtime_profile = parse_runtime_profile(recommended).with_context(|| {
+                format!(
+                    "unsupported runtime profile '{}' in {}",
+                    recommended,
+                    report_path.display()
+                )
+            })?;
+            let exact = report.size_gib == requested_profile.size_gib
+                && report.lanes == requested_profile.lanes
+                && report.io_chunk_bytes == requested_profile.io_chunk_bytes
+                && report.no_disk == requested_profile.no_disk;
+            let selection = if exact {
+                format!(
+                    "auto-selected runtime-profile={} from {}",
+                    runtime_profile.as_str(),
+                    report_path.display()
+                )
+            } else {
+                format!(
+                    "auto-selected runtime-profile={} from {} (report profile size_gib={} lanes={} io_chunk_bytes={} no_disk={})",
+                    runtime_profile.as_str(),
+                    report_path.display(),
+                    report.size_gib,
+                    report.lanes,
+                    report.io_chunk_bytes,
+                    report.no_disk
+                )
+            };
+            return Ok((Some(runtime_profile), Some(selection)));
+        }
+    }
+
+    if let Some(policy_path) = runtime_policy_path {
+        let policy = read_runtime_policy(policy_path).await?;
+        if let Some(selection) = select_runtime_policy(&policy, requested_profile) {
+            let runtime_profile = parse_runtime_profile(&selection.entry.recommended_profile)
+                .with_context(|| {
+                    format!(
+                        "unsupported runtime profile '{}' in runtime policy {}",
+                        selection.entry.recommended_profile,
+                        policy_path.display()
+                    )
+                })?;
+            let selection_note = if selection.exact_profile_match {
+                format!(
+                    "auto-selected runtime-profile={} from runtime policy {}",
+                    runtime_profile.as_str(),
+                    policy_path.display()
+                )
+            } else {
+                format!(
+                    "auto-selected runtime-profile={} from runtime policy {} fallback profile size_gib={} lanes={} io_chunk_bytes={} no_disk={}",
+                    runtime_profile.as_str(),
+                    policy_path.display(),
+                    selection.entry.profile.size_gib,
+                    selection.entry.profile.lanes,
+                    selection.entry.profile.io_chunk_bytes,
+                    selection.entry.profile.no_disk
+                )
+            };
+            return Ok((Some(runtime_profile), Some(selection_note)));
+        }
+    }
+
+    Ok((None, None))
+}
+
 async fn run_benchmark_with_progress(
     http: &Client,
     server: &str,
@@ -1453,6 +1622,19 @@ async fn run_benchmark_with_progress(
         args.auto_lanes_report.as_deref(),
         args.lane_policy.as_deref(),
         &workload_profile,
+    )
+    .await?;
+    let runtime_workload_profile = RuntimeWorkloadProfile {
+        size_gib: args.size_gib,
+        lanes: selected_lanes,
+        io_chunk_bytes: args.io_chunk_bytes,
+        no_disk: args.no_disk,
+    };
+    let (selected_runtime_profile, runtime_profile_selection) = resolve_benchmark_runtime_profile(
+        args.runtime_profile,
+        args.auto_runtime_report.as_deref(),
+        args.runtime_policy.as_deref(),
+        &runtime_workload_profile,
     )
     .await?;
 
@@ -1508,8 +1690,9 @@ async fn run_benchmark_with_progress(
         progress_interval_secs,
         selected_lanes,
         lane_selection,
-        args.runtime_profile,
+        selected_runtime_profile,
         args.file_read_pipeline_depth,
+        runtime_profile_selection,
     )
     .await
 }
@@ -1531,6 +1714,7 @@ pub async fn send_transfer(
         None,
         args.runtime_profile,
         args.file_read_pipeline_depth,
+        None,
     )
     .await
 }
@@ -1547,6 +1731,7 @@ async fn send_transfer_with_source(
     lane_selection: Option<String>,
     runtime_profile: Option<RuntimeProfile>,
     file_read_pipeline_depth: Option<usize>,
+    runtime_profile_selection: Option<String>,
 ) -> Result<SendTransferReport> {
     if lanes == 0 {
         anyhow::bail!("lanes must be > 0");
@@ -1657,6 +1842,15 @@ async fn send_transfer_with_source(
         (bytes_streamed_this_session as f64 * 8.0)
             / ((elapsed_ms as f64 / 1000.0) * 1_000_000_000.0)
     };
+    let runtime_selection = match (
+        runtime_profile_selection,
+        runtime_tuning.runtime_selection.clone(),
+    ) {
+        (Some(selection), Some(details)) => Some(format!("{selection}; {details}")),
+        (Some(selection), None) => Some(selection),
+        (None, Some(details)) => Some(details),
+        (None, None) => None,
+    };
 
     Ok(SendTransferReport {
         transfer_id: transfer.transfer_id,
@@ -1668,7 +1862,7 @@ async fn send_transfer_with_source(
             .map(|profile| profile.as_str().to_owned()),
         effective_io_chunk_bytes: runtime_tuning.effective_io_chunk_bytes,
         file_read_pipeline_depth: runtime_tuning.file_read_pipeline_depth,
-        runtime_selection: runtime_tuning.runtime_selection.clone(),
+        runtime_selection,
         lane_selection,
         resumed_from_bytes,
         bytes_streamed_this_session,
