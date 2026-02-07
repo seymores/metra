@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "Localhost no-disk tune-lanes baseline for CI regression gating.",
+  "default_max_regression_percent": 40.0,
+  "default_min_success_rate": 0.5,
+  "min_recommended_score": 0.05,
+  "candidates": {
+    "1": {
+      "baseline_p50_gbps": 0.2
+    },
+    "2": {
+      "baseline_p50_gbps": 0.2
+    }
+  }
+}

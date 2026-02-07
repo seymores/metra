@@ -255,6 +255,17 @@ cargo run --release -p metra-client -- --output json transfer tune-lanes \
   --cleanup-file
 ```
 
+`transfer tune-lanes` recommendation now uses weighted scoring:
+- aggregate p50 throughput
+- iteration success rate
+- stability factor (`p50 / p95`, clamped)
+
+Report fields:
+- `recommendation_strategy`
+- `recommendation_score`
+- `recommendation_reason`
+- per-candidate `success_rate`, `stability_factor`, `recommendation_score`
+
 Use a previously exported tune-lanes report to auto-select lane count for new benchmarks:
 
 ```bash
@@ -349,9 +360,13 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - Workflow: `.github/workflows/benchmark-gate.yml`
 - Baseline config: `ci/benchmark-baseline.json`
 - Gate script: `scripts/ci/benchmark_gate.py`
+- Lane baseline config: `ci/lane-baseline.json`
+- Lane gate script: `scripts/ci/lane_gate.py`
 
 The gate runs `transfer tune-runtime` against localhost (`--no-disk`) and fails CI if any
 runtime profile p50 throughput regresses below baseline threshold.
+It also runs `transfer tune-lanes` and fails CI if lane throughput/success/stability regresses
+below lane baseline thresholds.
 
 ## Current Limitations
 
@@ -396,6 +411,8 @@ runtime profile p50 throughput regresses below baseline threshold.
 - [x] Add auto runtime-profile selection from tune-runtime reports (`--auto-runtime-report`).
 - [x] Fix striped null-sink transfer completion/status accounting (`--no-disk` multi-lane).
 - [x] Add CI runtime-profile regression gate (`benchmark-gate` workflow).
+- [x] Add adaptive lane recommendation scoring (`p50 * success_rate * stability`).
+- [x] Add CI lane scheduling regression gate (throughput + success-rate assertions).
 
 ### Near-term Performance Roadmap
 

@@ -169,6 +169,12 @@ pub struct TuneLanesReport {
     no_disk: bool,
     lane_candidates: Vec<u32>,
     recommended_lanes: Option<u32>,
+    #[serde(default)]
+    recommendation_strategy: Option<String>,
+    #[serde(default)]
+    recommendation_score: Option<f64>,
+    #[serde(default)]
+    recommendation_reason: Option<String>,
     candidates: Vec<TuneLanesCandidate>,
 }
 
@@ -179,6 +185,12 @@ pub struct TuneLanesCandidate {
     transfer_gbps: ThroughputStats,
     successful_runs: u32,
     failed_runs: u32,
+    #[serde(default)]
+    success_rate: Option<f64>,
+    #[serde(default)]
+    stability_factor: Option<f64>,
+    #[serde(default)]
+    recommendation_score: Option<f64>,
     runs: Vec<TuneLanesRun>,
 }
 
@@ -1129,12 +1141,27 @@ pub async fn run_tune_lanes_under_load(
             });
         }
 
+        let total_runs = successful_runs + failed_runs;
+        let success_rate = if total_runs == 0 {
+            0.0
+        } else {
+            successful_runs as f64 / total_runs as f64
+        };
+        let aggregate_summary = summarize_values(&aggregate_values);
+        let transfer_summary = summarize_values(&transfer_values);
+        let stability_factor = lane_stability_factor(&aggregate_summary);
+        let recommendation_score =
+            lane_recommendation_score(aggregate_summary.p50, success_rate, stability_factor);
+
         candidates.push(TuneLanesCandidate {
             lanes,
-            aggregate_gbps: summarize_values(&aggregate_values),
-            transfer_gbps: summarize_values(&transfer_values),
+            aggregate_gbps: aggregate_summary,
+            transfer_gbps: transfer_summary,
             successful_runs,
             failed_runs,
+            success_rate: Some(success_rate),
+            stability_factor: Some(stability_factor),
+            recommendation_score: Some(recommendation_score),
             runs,
         });
     }
@@ -1153,7 +1180,8 @@ pub async fn run_tune_lanes_under_load(
         }
     }
 
-    let recommended_lanes = recommended_lanes_from_candidates(&candidates);
+    let recommendation = recommended_lane_candidate(&candidates);
+    let recommended_lanes = recommendation.as_ref().map(|value| value.lanes);
     let report = TuneLanesReport {
         server: server.to_owned(),
         started_at,
@@ -1165,6 +1193,11 @@ pub async fn run_tune_lanes_under_load(
         no_disk: args.no_disk,
         lane_candidates: lane_candidates.clone(),
         recommended_lanes,
+        recommendation_strategy: recommendation
+            .as_ref()
+            .map(|_| "throughput_stability_success_weighted".to_owned()),
+        recommendation_score: recommendation.as_ref().map(|value| value.score),
+        recommendation_reason: recommendation.map(|value| value.reason),
         candidates,
     };
 
@@ -1341,12 +1374,84 @@ pub async fn run_tune_runtime_profiles(
     Ok(report)
 }
 
-fn recommended_lanes_from_candidates(candidates: &[TuneLanesCandidate]) -> Option<u32> {
-    candidates
+#[derive(Debug, Clone)]
+struct RecommendedLaneCandidate {
+    lanes: u32,
+    score: f64,
+    reason: String,
+}
+
+fn lane_stability_factor(aggregate: &ThroughputStats) -> f64 {
+    if aggregate.p95 <= 0.0 {
+        0.0
+    } else {
+        (aggregate.p50 / aggregate.p95).clamp(0.0, 1.0)
+    }
+}
+
+fn lane_recommendation_score(p50_gbps: f64, success_rate: f64, stability_factor: f64) -> f64 {
+    p50_gbps.max(0.0) * success_rate.clamp(0.0, 1.0) * stability_factor.clamp(0.0, 1.0)
+}
+
+fn candidate_success_rate(candidate: &TuneLanesCandidate) -> f64 {
+    if let Some(value) = candidate.success_rate {
+        return value.clamp(0.0, 1.0);
+    }
+    let total = candidate.successful_runs + candidate.failed_runs;
+    if total == 0 {
+        0.0
+    } else {
+        candidate.successful_runs as f64 / total as f64
+    }
+}
+
+fn candidate_stability_factor(candidate: &TuneLanesCandidate) -> f64 {
+    if let Some(value) = candidate.stability_factor {
+        return value.clamp(0.0, 1.0);
+    }
+    lane_stability_factor(&candidate.aggregate_gbps)
+}
+
+fn candidate_recommendation_score(candidate: &TuneLanesCandidate) -> f64 {
+    if let Some(value) = candidate.recommendation_score {
+        return value.max(0.0);
+    }
+    lane_recommendation_score(
+        candidate.aggregate_gbps.p50,
+        candidate_success_rate(candidate),
+        candidate_stability_factor(candidate),
+    )
+}
+
+fn recommended_lane_candidate(
+    candidates: &[TuneLanesCandidate],
+) -> Option<RecommendedLaneCandidate> {
+    let selected = candidates
         .iter()
         .filter(|candidate| candidate.successful_runs > 0)
-        .max_by(|left, right| left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
-        .map(|candidate| candidate.lanes)
+        .max_by(|left, right| {
+            candidate_recommendation_score(left)
+                .total_cmp(&candidate_recommendation_score(right))
+                .then(left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
+                .then(right.successful_runs.cmp(&left.successful_runs))
+                .then(right.lanes.cmp(&left.lanes))
+        })?;
+    let success_rate = candidate_success_rate(selected);
+    let stability_factor = candidate_stability_factor(selected);
+    let score = candidate_recommendation_score(selected);
+    let reason = format!(
+        "selected lanes={} score={:.3} (p50={:.3}Gbps success_rate={:.2} stability={:.2})",
+        selected.lanes, score, selected.aggregate_gbps.p50, success_rate, stability_factor
+    );
+    Some(RecommendedLaneCandidate {
+        lanes: selected.lanes,
+        score,
+        reason,
+    })
+}
+
+fn recommended_lanes_from_candidates(candidates: &[TuneLanesCandidate]) -> Option<u32> {
+    recommended_lane_candidate(candidates).map(|value| value.lanes)
 }
 
 fn recommended_lanes_from_report(report: &TuneLanesReport) -> Option<u32> {
@@ -2355,5 +2460,112 @@ mod tests {
                 .expect("runtime tuning should resolve");
         assert_eq!(tuning.effective_io_chunk_bytes, 32 * 1024 * 1024);
         assert_eq!(tuning.file_read_pipeline_depth, 6);
+    }
+
+    fn stats(p50: f64, p95: f64) -> ThroughputStats {
+        ThroughputStats {
+            min: p50,
+            p50,
+            p95,
+            max: p95,
+            mean: (p50 + p95) / 2.0,
+        }
+    }
+
+    #[test]
+    fn lane_recommendation_prefers_stable_successful_candidate() {
+        let candidates = vec![
+            TuneLanesCandidate {
+                lanes: 4,
+                aggregate_gbps: stats(2.4, 4.8),
+                transfer_gbps: stats(1.0, 1.0),
+                successful_runs: 1,
+                failed_runs: 3,
+                success_rate: None,
+                stability_factor: None,
+                recommendation_score: None,
+                runs: Vec::new(),
+            },
+            TuneLanesCandidate {
+                lanes: 2,
+                aggregate_gbps: stats(1.9, 2.0),
+                transfer_gbps: stats(1.0, 1.0),
+                successful_runs: 4,
+                failed_runs: 0,
+                success_rate: None,
+                stability_factor: None,
+                recommendation_score: None,
+                runs: Vec::new(),
+            },
+        ];
+
+        let selected = recommended_lane_candidate(&candidates).expect("expected recommendation");
+        assert_eq!(selected.lanes, 2);
+        assert!(selected.score > 0.0);
+    }
+
+    #[test]
+    fn lane_recommendation_prefers_lower_lane_count_on_tie() {
+        let candidates = vec![
+            TuneLanesCandidate {
+                lanes: 1,
+                aggregate_gbps: stats(1.0, 1.0),
+                transfer_gbps: stats(1.0, 1.0),
+                successful_runs: 1,
+                failed_runs: 0,
+                success_rate: Some(1.0),
+                stability_factor: Some(1.0),
+                recommendation_score: Some(1.0),
+                runs: Vec::new(),
+            },
+            TuneLanesCandidate {
+                lanes: 2,
+                aggregate_gbps: stats(1.0, 1.0),
+                transfer_gbps: stats(1.0, 1.0),
+                successful_runs: 1,
+                failed_runs: 0,
+                success_rate: Some(1.0),
+                stability_factor: Some(1.0),
+                recommendation_score: Some(1.0),
+                runs: Vec::new(),
+            },
+        ];
+
+        let selected = recommended_lane_candidate(&candidates).expect("expected recommendation");
+        assert_eq!(selected.lanes, 1);
+    }
+
+    #[test]
+    fn tune_lanes_report_backward_compatible_without_new_fields() {
+        let payload = r#"
+        {
+          "server":"http://127.0.0.1:8080",
+          "started_at":"2026-02-07T00:00:00Z",
+          "completed_at":"2026-02-07T00:00:10Z",
+          "size_gib":1,
+          "concurrency":2,
+          "iterations":1,
+          "io_chunk_bytes":8388608,
+          "no_disk":true,
+          "lane_candidates":[1,2],
+          "recommended_lanes":2,
+          "candidates":[
+            {
+              "lanes":2,
+              "aggregate_gbps":{"min":1.0,"p50":1.0,"p95":1.2,"max":1.2,"mean":1.1},
+              "transfer_gbps":{"min":0.5,"p50":0.5,"p95":0.6,"max":0.6,"mean":0.55},
+              "successful_runs":1,
+              "failed_runs":0,
+              "runs":[]
+            }
+          ]
+        }
+        "#;
+        let report: TuneLanesReport =
+            serde_json::from_str(payload).expect("report should deserialize");
+        assert_eq!(report.recommended_lanes, Some(2));
+        assert_eq!(report.recommendation_strategy, None);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].recommendation_score, None);
     }
 }

@@ -59,6 +59,23 @@ jobs:
             --report /tmp/metra-reports/tune-runtime-ci.json \
             --baseline ci/benchmark-baseline.json
 
+      - name: Run lane tuning benchmark
+        run: |
+          target/release/metra-client --server http://127.0.0.1:8080 --output json transfer tune-lanes \
+            --size-gib 1 \
+            --lanes 1,2 \
+            --concurrency 2 \
+            --iterations 1 \
+            --io-chunk-bytes 8388608 \
+            --no-disk \
+            --json-out /tmp/metra-reports/tune-lanes-ci.json
+
+      - name: Check lane scheduling regression gate
+        run: |
+          python3 scripts/ci/lane_gate.py \
+            --report /tmp/metra-reports/tune-lanes-ci.json \
+            --baseline ci/lane-baseline.json
+
       - name: Dump server log on failure
         if: failure()
         run: |
