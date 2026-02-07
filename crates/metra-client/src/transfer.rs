@@ -14,7 +14,7 @@ use metra_proto::{
     QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES,
 };
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::{
     fs::{self, OpenOptions},
@@ -37,6 +37,8 @@ pub struct SendTransferReport {
     transfer_id: Uuid,
     file_path: String,
     file_size_bytes: u64,
+    effective_lanes: u32,
+    lane_selection: Option<String>,
     resumed_from_bytes: u64,
     bytes_streamed_this_session: u64,
     total_streamed_bytes: u64,
@@ -107,7 +109,7 @@ pub struct BenchmarkCompareSeriesReport {
     reports: Vec<BenchmarkCompareReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuneLanesReport {
     server: String,
     started_at: DateTime<Utc>,
@@ -122,7 +124,7 @@ pub struct TuneLanesReport {
     candidates: Vec<TuneLanesCandidate>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuneLanesCandidate {
     lanes: u32,
     aggregate_gbps: ThroughputStats,
@@ -132,7 +134,7 @@ pub struct TuneLanesCandidate {
     runs: Vec<TuneLanesRun>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuneLanesRun {
     iteration: u32,
     lanes: u32,
@@ -171,7 +173,7 @@ pub struct BenchmarkCompareIteration {
     host_total_delta: HostTelemetryDelta,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThroughputStats {
     min: f64,
     p50: f64,
@@ -180,7 +182,7 @@ pub struct ThroughputStats {
     mean: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostTelemetrySnapshot {
     captured_at: DateTime<Utc>,
     global_cpu_percent: f64,
@@ -194,7 +196,7 @@ pub struct HostTelemetrySnapshot {
     load_avg_fifteen: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostTelemetryDelta {
     global_cpu_percent_delta: f64,
     used_memory_bytes_delta: i64,
@@ -322,6 +324,7 @@ pub async fn run_benchmark_matrix(
                     io_chunk_bytes: *io_chunk_bytes,
                     lanes: *lanes,
                     no_disk: args.no_disk,
+                    auto_lanes_report: args.auto_lanes_report.clone(),
                 };
 
                 let result = run_benchmark_with_progress(http, server, bench_args, 0).await;
@@ -430,6 +433,7 @@ pub async fn run_benchmark_compare(
             io_chunk_bytes: args.io_chunk_bytes,
             lanes: args.lanes,
             no_disk: false,
+            auto_lanes_report: None,
         };
         let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
         let host_after_disk = telemetry.sample();
@@ -444,6 +448,7 @@ pub async fn run_benchmark_compare(
             io_chunk_bytes: args.io_chunk_bytes,
             lanes: args.lanes,
             no_disk: true,
+            auto_lanes_report: None,
         };
         let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
         let host_after_no_disk = telemetry.sample();
@@ -733,6 +738,7 @@ pub async fn run_tune_lanes_under_load(
                         io_chunk_bytes,
                         0,
                         lanes,
+                        None,
                     )
                     .await
                 });
@@ -838,12 +844,70 @@ pub async fn run_tune_lanes_under_load(
     Ok(report)
 }
 
+async fn resolve_benchmark_lanes(
+    configured_lanes: u32,
+    auto_lanes_report: Option<&Path>,
+    size_gib: u64,
+) -> Result<(u32, Option<String>)> {
+    if configured_lanes == 0 {
+        anyhow::bail!("lanes must be > 0");
+    }
+
+    let Some(report_path) = auto_lanes_report else {
+        return Ok((configured_lanes, None));
+    };
+
+    let payload = fs::read(report_path)
+        .await
+        .with_context(|| format!("failed reading auto lanes report {}", report_path.display()))?;
+    let report = serde_json::from_slice::<TuneLanesReport>(&payload).with_context(|| {
+        format!(
+            "failed parsing auto lanes report JSON {}",
+            report_path.display()
+        )
+    })?;
+
+    let selected = report.recommended_lanes.or_else(|| {
+        report
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.successful_runs > 0)
+            .max_by(|left, right| left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
+            .map(|candidate| candidate.lanes)
+    });
+
+    if let Some(lanes) = selected.filter(|lanes| *lanes > 0) {
+        let selection = if report.size_gib == size_gib {
+            format!(
+                "auto-selected lanes={} from {}",
+                lanes,
+                report_path.display()
+            )
+        } else {
+            format!(
+                "auto-selected lanes={} from {} (report size_gib={} requested size_gib={})",
+                lanes,
+                report_path.display(),
+                report.size_gib,
+                size_gib
+            )
+        };
+        return Ok((lanes, Some(selection)));
+    }
+
+    Ok((configured_lanes, None))
+}
+
 async fn run_benchmark_with_progress(
     http: &Client,
     server: &str,
     args: BenchArgs,
     progress_interval_secs: u64,
 ) -> Result<SendTransferReport> {
+    let (selected_lanes, lane_selection) =
+        resolve_benchmark_lanes(args.lanes, args.auto_lanes_report.as_deref(), args.size_gib)
+            .await?;
+
     let file_size_bytes = args.size_gib * 1024 * 1024 * 1024;
     let file_name = args
         .file_path
@@ -894,7 +958,8 @@ async fn run_benchmark_with_progress(
         args.quic_addr,
         args.io_chunk_bytes,
         progress_interval_secs,
-        args.lanes,
+        selected_lanes,
+        lane_selection,
     )
     .await
 }
@@ -913,6 +978,7 @@ pub async fn send_transfer(
         args.io_chunk_bytes,
         args.progress_interval_secs,
         args.lanes,
+        None,
     )
     .await
 }
@@ -926,6 +992,7 @@ async fn send_transfer_with_source(
     io_chunk_bytes: usize,
     progress_interval_secs: u64,
     lanes: u32,
+    lane_selection: Option<String>,
 ) -> Result<SendTransferReport> {
     if io_chunk_bytes == 0 {
         anyhow::bail!("io_chunk_bytes must be > 0");
@@ -1033,6 +1100,8 @@ async fn send_transfer_with_source(
         transfer_id: transfer.transfer_id,
         file_path: source.label(),
         file_size_bytes: transfer.file_size_bytes,
+        effective_lanes: lanes,
+        lane_selection,
         resumed_from_bytes,
         bytes_streamed_this_session,
         total_streamed_bytes: complete_ack.bytes_received,

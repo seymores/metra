@@ -107,6 +107,8 @@ pub struct BenchArgs {
     pub lanes: u32,
     #[arg(long, default_value_t = false)]
     pub no_disk: bool,
+    #[arg(long)]
+    pub auto_lanes_report: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -135,6 +137,8 @@ pub struct MatrixArgs {
     pub cleanup_files: bool,
     #[arg(long, default_value_t = false)]
     pub no_disk: bool,
+    #[arg(long)]
+    pub auto_lanes_report: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]

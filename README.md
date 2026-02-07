@@ -163,6 +163,18 @@ cargo run --release -p metra-client -- --output json transfer tune-lanes \
   --cleanup-file
 ```
 
+Use a previously exported tune-lanes report to auto-select lane count for new benchmarks:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer bench \
+  --size-gib 1 \
+  --file-path /tmp/metra-auto-lane-1g.bin \
+  --io-chunk-bytes 16777216 \
+  --lanes 1 \
+  --no-disk \
+  --auto-lanes-report /tmp/metra-reports/tune-lanes-1g-c2-i2.json
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -196,6 +208,9 @@ cargo run --release -p metra-client -- --output json transfer tune-lanes \
   - recommended lanes: `2`
   - lane 1 aggregate: `~1.90 Gbps`
   - lane 2 aggregate: `~2.20 Gbps`
+- Auto-lane bench sample (1 GiB no-disk, configured `--lanes 1` + tune report):
+  - effective lanes: `2` (auto-selected from report)
+  - achieved throughput: `~1.72 Gbps`
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -236,7 +251,8 @@ These measurements are local environment baselines and do not represent target W
 - [x] Add repeated compare benchmark with p50/p95 reporting (`transfer compare --iterations`).
 - [x] Add multi-size compare benchmark series (`transfer compare-series`).
 - [x] Add host/runtime telemetry to compare reports (start/phase/end snapshots and deltas).
-- [ ] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
+- [x] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
+- [ ] Add lane-policy persistence by workload profile (size/concurrency) and automatic fallback.
 
 ### Near-term Performance Roadmap
 
