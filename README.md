@@ -287,6 +287,8 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 ### Near-term Performance Roadmap
 
 - [ ] Implement bounded pipeline stages for read/encrypt-send/receive-write.
+  - Client file-source read/send path now uses bounded pipelining with backpressure and buffer reuse.
+  - Server receive/write bounded pipeline still pending.
 - [x] Add per-lane and aggregate throughput metrics via OpenTelemetry.
 - [ ] Add CPU and runtime tuning profile (thread affinity, buffer sizing).
 - [ ] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.

@@ -19,6 +19,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt as TokioAsyncReadExt, AsyncSeekExt, SeekFrom},
+    sync::mpsc,
     task::JoinSet,
     time::sleep,
 };
@@ -245,6 +246,8 @@ struct LaneTransferResult {
     resumed_from_bytes: u64,
     complete_ack: QuicTransferCompleteAck,
 }
+
+const FILE_READ_PIPELINE_DEPTH: usize = 4;
 
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -1258,56 +1261,30 @@ async fn send_lane(
         );
     }
 
-    let mut buffer = vec![0u8; lane.io_chunk_bytes];
-    let mut remaining = lane.range_end_exclusive - open_ack.resume_offset_bytes;
-    let mut bytes_streamed = 0u64;
-
-    match &lane.source {
+    let bytes_streamed = match &lane.source {
         PayloadSource::File(file_path) => {
-            let mut file = fs::File::open(file_path)
-                .await
-                .with_context(|| format!("failed opening file {}", file_path.display()))?;
-            file.seek(SeekFrom::Start(open_ack.resume_offset_bytes))
-                .await
-                .context("failed seeking local file for resume")?;
-
-            while remaining > 0 {
-                let read_len = remaining.min(buffer.len() as u64) as usize;
-                let bytes_read = file
-                    .read(&mut buffer[..read_len])
-                    .await
-                    .context("failed reading local file")?;
-                if bytes_read == 0 {
-                    anyhow::bail!(
-                        "unexpected EOF while sending lane {} (remaining {} bytes)",
-                        lane.lane_index,
-                        remaining
-                    );
-                }
-                send_stream
-                    .write_all(&buffer[..bytes_read])
-                    .await
-                    .context("failed writing stream payload")?;
-                let written = bytes_read as u64;
-                remaining -= written;
-                bytes_streamed += written;
-                progress_bytes.fetch_add(written, Ordering::Relaxed);
-            }
+            send_file_lane_pipelined(
+                &mut send_stream,
+                file_path,
+                open_ack.resume_offset_bytes,
+                lane.range_end_exclusive,
+                lane.io_chunk_bytes,
+                lane.lane_index,
+                progress_bytes.clone(),
+            )
+            .await?
         }
         PayloadSource::GeneratedZeros { .. } => {
-            while remaining > 0 {
-                let to_send = remaining.min(buffer.len() as u64) as usize;
-                send_stream
-                    .write_all(&buffer[..to_send])
-                    .await
-                    .context("failed writing generated payload")?;
-                let written = to_send as u64;
-                remaining -= written;
-                bytes_streamed += written;
-                progress_bytes.fetch_add(written, Ordering::Relaxed);
-            }
+            send_generated_lane(
+                &mut send_stream,
+                open_ack.resume_offset_bytes,
+                lane.range_end_exclusive,
+                lane.io_chunk_bytes,
+                progress_bytes.clone(),
+            )
+            .await?
         }
-    }
+    };
 
     send_stream.finish()?;
     let complete_ack = read_json_frame::<QuicTransferCompleteAck>(&mut recv_stream).await?;
@@ -1316,6 +1293,136 @@ async fn send_lane(
         resumed_from_bytes: open_ack.resume_offset_bytes - lane.range_start,
         complete_ack,
     })
+}
+
+async fn send_file_lane_pipelined(
+    send_stream: &mut quinn::SendStream,
+    file_path: &Path,
+    resume_offset: u64,
+    range_end_exclusive: u64,
+    io_chunk_bytes: usize,
+    lane_index: u32,
+    progress_bytes: Arc<AtomicU64>,
+) -> Result<u64> {
+    let total_bytes = range_end_exclusive - resume_offset;
+    if total_bytes == 0 {
+        return Ok(0);
+    }
+
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<Vec<u8>>(FILE_READ_PIPELINE_DEPTH);
+    for _ in 0..FILE_READ_PIPELINE_DEPTH {
+        buffer_tx
+            .send(vec![0u8; io_chunk_bytes])
+            .await
+            .map_err(|_| anyhow::anyhow!("failed seeding file read pipeline buffers"))?;
+    }
+
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<(Vec<u8>, usize)>(FILE_READ_PIPELINE_DEPTH);
+    let file_path = file_path.to_path_buf();
+    let producer = tokio::spawn(async move {
+        let mut file = fs::File::open(&file_path)
+            .await
+            .with_context(|| format!("failed opening file {}", file_path.display()))?;
+        file.seek(SeekFrom::Start(resume_offset))
+            .await
+            .context("failed seeking local file for resume")?;
+
+        let mut remaining = total_bytes;
+        while remaining > 0 {
+            let mut buffer = buffer_rx
+                .recv()
+                .await
+                .context("file read pipeline buffer pool unexpectedly closed")?;
+            let read_len = remaining.min(buffer.len() as u64) as usize;
+            let bytes_read = file
+                .read(&mut buffer[..read_len])
+                .await
+                .context("failed reading local file")?;
+            if bytes_read == 0 {
+                anyhow::bail!(
+                    "unexpected EOF while sending lane {} (remaining {} bytes)",
+                    lane_index,
+                    remaining
+                );
+            }
+            chunk_tx.send((buffer, bytes_read)).await.map_err(|_| {
+                anyhow::anyhow!("file read pipeline chunk channel unexpectedly closed")
+            })?;
+            remaining -= bytes_read as u64;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let consume_result = async {
+        let mut remaining = total_bytes;
+        let mut bytes_streamed = 0u64;
+
+        while remaining > 0 {
+            let (buffer, bytes_read) = chunk_rx
+                .recv()
+                .await
+                .context("file read pipeline ended before lane completion")?;
+            send_stream
+                .write_all(&buffer[..bytes_read])
+                .await
+                .context("failed writing stream payload")?;
+            let written = bytes_read as u64;
+            remaining = remaining.saturating_sub(written);
+            bytes_streamed += written;
+            progress_bytes.fetch_add(written, Ordering::Relaxed);
+            let _ = buffer_tx.send(buffer).await;
+        }
+
+        if bytes_streamed != total_bytes {
+            anyhow::bail!(
+                "lane {} streamed {} bytes but expected {}",
+                lane_index,
+                bytes_streamed,
+                total_bytes
+            );
+        }
+        Ok::<_, anyhow::Error>(bytes_streamed)
+    }
+    .await;
+
+    match consume_result {
+        Ok(bytes_streamed) => {
+            let producer_result = producer.await.context("file read pipeline task panicked")?;
+            producer_result?;
+            Ok(bytes_streamed)
+        }
+        Err(err) => {
+            producer.abort();
+            let _ = producer.await;
+            Err(err)
+        }
+    }
+}
+
+async fn send_generated_lane(
+    send_stream: &mut quinn::SendStream,
+    resume_offset: u64,
+    range_end_exclusive: u64,
+    io_chunk_bytes: usize,
+    progress_bytes: Arc<AtomicU64>,
+) -> Result<u64> {
+    let buffer = vec![0u8; io_chunk_bytes];
+    let mut remaining = range_end_exclusive - resume_offset;
+    let mut bytes_streamed = 0u64;
+
+    while remaining > 0 {
+        let to_send = remaining.min(buffer.len() as u64) as usize;
+        send_stream
+            .write_all(&buffer[..to_send])
+            .await
+            .context("failed writing generated payload")?;
+        let written = to_send as u64;
+        remaining -= written;
+        bytes_streamed += written;
+        progress_bytes.fetch_add(written, Ordering::Relaxed);
+    }
+
+    Ok(bytes_streamed)
 }
 
 fn normalized_lane_count(lanes: u32, file_size_bytes: u64) -> u32 {
