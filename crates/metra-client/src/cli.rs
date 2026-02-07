@@ -102,6 +102,8 @@ pub struct BenchArgs {
     pub io_chunk_bytes: usize,
     #[arg(long, default_value_t = 1)]
     pub lanes: u32,
+    #[arg(long, default_value_t = false)]
+    pub no_disk: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -128,4 +130,6 @@ pub struct MatrixArgs {
     pub quic_addr: Option<SocketAddr>,
     #[arg(long, default_value_t = true)]
     pub cleanup_files: bool,
+    #[arg(long, default_value_t = false)]
+    pub no_disk: bool,
 }

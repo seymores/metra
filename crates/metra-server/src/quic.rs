@@ -29,6 +29,10 @@ use crate::{
 const PROGRESS_UPDATE_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHUNK_READ_BYTES: usize = 8 * 1024 * 1024;
 
+fn is_null_sink_uri(uri: &str) -> bool {
+    uri.starts_with("null://") || uri.starts_with("memory://") || uri.starts_with("mem://")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LaneCheckpoint {
     lane_index: u32,
@@ -231,7 +235,7 @@ async fn handle_quic_stream(
     let striped =
         total_lanes > 1 || range_start != 0 || range_end_exclusive != open.file_size_bytes;
 
-    let (staging_path, final_path, checkpoint_path, resume_offset) = {
+    let (staging_path, final_path, checkpoint_path, resume_offset, discard_payload) = {
         let mut transfers = state.transfers.write().await;
         let transfer = transfers
             .get_mut(&open.transfer_id)
@@ -263,6 +267,7 @@ async fn handle_quic_stream(
         let staging_path = tenant_dir.join(format!("{}.part", transfer.transfer_id));
         let final_path = tenant_dir.join(&transfer.file_name);
         let checkpoint_path = checkpoint_path_for(&tenant_dir, transfer.transfer_id);
+        let discard_payload = is_null_sink_uri(&transfer.destination_uri);
 
         let resume_offset = if striped {
             let (lane_resume, total_transferred) = load_or_init_lane_resume(
@@ -278,6 +283,8 @@ async fn handle_quic_stream(
             .await?;
             transfer.bytes_transferred = total_transferred.min(transfer.file_size_bytes);
             lane_resume
+        } else if discard_payload {
+            transfer.bytes_transferred.min(transfer.file_size_bytes)
         } else {
             let resume = match fs::metadata(&staging_path).await {
                 Ok(meta) => meta.len(),
@@ -297,10 +304,16 @@ async fn handle_quic_stream(
 
         transfer.status = TransferStatus::Running;
         transfer.updated_at = Utc::now();
-        (staging_path, final_path, checkpoint_path, resume_offset)
+        (
+            staging_path,
+            final_path,
+            checkpoint_path,
+            resume_offset,
+            discard_payload,
+        )
     };
 
-    if striped {
+    if striped && !discard_payload {
         let staging_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -331,17 +344,22 @@ async fn handle_quic_stream(
         "accepted upload stream"
     );
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .truncate(false)
-        .open(&staging_path)
-        .await
-        .with_context(|| format!("failed opening staging file {}", staging_path.display()))?;
-    file.seek(SeekFrom::Start(resume_offset))
-        .await
-        .context("failed seeking staging file")?;
+    let mut file = if discard_payload {
+        None
+    } else {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .open(&staging_path)
+            .await
+            .with_context(|| format!("failed opening staging file {}", staging_path.display()))?;
+        file.seek(SeekFrom::Start(resume_offset))
+            .await
+            .context("failed seeking staging file")?;
+        Some(file)
+    };
 
     let expected_bytes = range_end_exclusive - resume_offset;
     let mut stream_bytes_written: u64 = 0;
@@ -376,9 +394,11 @@ async fn handle_quic_stream(
 
         let remaining = expected_bytes - stream_bytes_written;
         let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
-        file.write_all(&chunk.bytes[..to_write])
-            .await
-            .context("failed writing transfer chunk to disk")?;
+        if let Some(file) = file.as_mut() {
+            file.write_all(&chunk.bytes[..to_write])
+                .await
+                .context("failed writing transfer chunk to disk")?;
+        }
         if to_write < chunk.bytes.len() {
             bail!(
                 "received lane payload overflow for transfer {} lane {}",
@@ -427,9 +447,11 @@ async fn handle_quic_stream(
         );
     }
 
-    file.flush()
-        .await
-        .context("failed flushing transfer file")?;
+    if let Some(file) = file.as_mut() {
+        file.flush()
+            .await
+            .context("failed flushing transfer file")?;
+    }
 
     let complete = if striped {
         finalize_if_ready(
@@ -438,8 +460,12 @@ async fn handle_quic_stream(
             &staging_path,
             &final_path,
             &checkpoint_path,
+            discard_payload,
         )
         .await?
+    } else if discard_payload {
+        let bytes_received = resume_offset + stream_bytes_written;
+        finalize_single_lane_transfer_memory(&state, open.transfer_id, bytes_received).await?
     } else {
         let bytes_received = resume_offset + stream_bytes_written;
         finalize_single_lane_transfer(
@@ -530,12 +556,46 @@ async fn finalize_single_lane_transfer(
     finalize_transfer_on_disk(state, transfer_id, staging_path, final_path).await
 }
 
+async fn finalize_single_lane_transfer_memory(
+    state: &AppState,
+    transfer_id: Uuid,
+    bytes_received: u64,
+) -> Result<FinalizeResult> {
+    let mut transfers = state.transfers.write().await;
+    let transfer = transfers
+        .get_mut(&transfer_id)
+        .with_context(|| format!("unknown transfer_id {transfer_id}"))?;
+
+    transfer.bytes_transferred = bytes_received.min(transfer.file_size_bytes);
+    transfer.updated_at = Utc::now();
+
+    if bytes_received != transfer.file_size_bytes {
+        transfer.status = TransferStatus::Failed;
+        return Ok(FinalizeResult {
+            status: TransferStatus::Failed,
+            bytes_transferred: transfer.bytes_transferred,
+            message: format!(
+                "incomplete stream: received {bytes_received} bytes, expected {}",
+                transfer.file_size_bytes
+            ),
+        });
+    }
+
+    transfer.status = TransferStatus::Completed;
+    Ok(FinalizeResult {
+        status: TransferStatus::Completed,
+        bytes_transferred: transfer.bytes_transferred,
+        message: "transfer finalized in null sink mode".to_owned(),
+    })
+}
+
 async fn finalize_if_ready(
     state: &AppState,
     transfer_id: Uuid,
     staging_path: &Path,
     final_path: &Path,
     checkpoint_path: &Path,
+    discard_payload: bool,
 ) -> Result<FinalizeResult> {
     let _finalize_guard = state.finalize_lock.lock().await;
 
@@ -568,7 +628,16 @@ async fn finalize_if_ready(
         });
     }
 
-    let finalized = finalize_transfer_on_disk(state, transfer_id, staging_path, final_path).await?;
+    let finalized = if discard_payload {
+        set_transfer_status(state, transfer_id, TransferStatus::Completed, total).await;
+        FinalizeResult {
+            status: TransferStatus::Completed,
+            bytes_transferred: total,
+            message: "transfer finalized in null sink mode".to_owned(),
+        }
+    } else {
+        finalize_transfer_on_disk(state, transfer_id, staging_path, final_path).await?
+    };
     if let Err(err) = fs::remove_file(checkpoint_path).await {
         warn!(
             error = %err,

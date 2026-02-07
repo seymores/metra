@@ -108,6 +108,17 @@ cargo run --release -p metra-client -- --output json transfer matrix \
   --cleanup-files
 ```
 
+Run a no-disk benchmark (client generates payload, server uses null sink) to isolate transfer-path overhead from filesystem I/O:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer bench \
+  --size-gib 4 \
+  --file-path /tmp/metra-bench-4g-nodisk.bin \
+  --io-chunk-bytes 16777216 \
+  --lanes 2 \
+  --no-disk
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -122,7 +133,10 @@ cargo run --release -p metra-client -- --output json transfer matrix \
 - Release client + release server (4 GiB, 4 lanes): ~1.23 Gbps.
 - Release client + release server (16 GiB, 4 lanes): ~1.21 Gbps.
 - Matrix (2 GiB; lanes=2/4/8; chunks=16 MiB/64 MiB): best ~1.21 Gbps at `lanes=2`, `chunk=16 MiB`.
+- No-disk matrix (2 GiB; lanes=2/4; chunk=16 MiB): best ~1.92 Gbps at `lanes=2`.
 - Release client + release server (16 GiB, 2 lanes, 16 MiB chunks): ~1.20 Gbps.
+- Release client + release server (4 GiB, disk-backed, 2 lanes, 16 MiB chunks): ~1.18 Gbps.
+- Release client + release server (4 GiB, `--no-disk`, 2 lanes, 16 MiB chunks): ~1.81 Gbps.
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -131,7 +145,7 @@ These measurements are local environment baselines and do not represent target W
 ## Current Limitations
 
 - Multi-lane transfer is currently an early implementation and still needs hardening.
-- Disk-backed local storage path only for data plane write target.
+- Data plane supports local disk target and null-sink benchmark target; no S3 path yet.
 - Striped resume checkpointing is implemented, but still needs adversarial/fault-injection test coverage.
 - No FEC, no multi-path QUIC, no congestion-controller tuning profiles yet.
 - Browser helper and extension are still pending implementation.

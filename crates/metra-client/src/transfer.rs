@@ -76,12 +76,27 @@ struct LaneConfig {
     file_size_bytes: u64,
     file_name: String,
     resume_chunk_size_bytes: u64,
-    file_path: PathBuf,
+    source: PayloadSource,
     io_chunk_bytes: usize,
     lane_index: u32,
     total_lanes: u32,
     range_start: u64,
     range_end_exclusive: u64,
+}
+
+#[derive(Clone)]
+enum PayloadSource {
+    File(PathBuf),
+    GeneratedZeros { label: String },
+}
+
+impl PayloadSource {
+    fn label(&self) -> String {
+        match self {
+            Self::File(path) => path.display().to_string(),
+            Self::GeneratedZeros { label } => label.clone(),
+        }
+    }
 }
 
 struct LaneTransferResult {
@@ -153,7 +168,11 @@ pub async fn run_benchmark_matrix(
 
     let started_at = Utc::now();
     let mut runs = Vec::new();
-    let destination_prefix = args.destination_prefix.trim_end_matches('/').to_owned();
+    let destination_prefix = if args.no_disk {
+        "null://benchmark".to_owned()
+    } else {
+        args.destination_prefix.trim_end_matches('/').to_owned()
+    };
 
     for size_gib in &args.sizes_gib {
         for lanes in &args.lanes {
@@ -169,6 +188,7 @@ pub async fn run_benchmark_matrix(
                     quic_addr: args.quic_addr,
                     io_chunk_bytes: *io_chunk_bytes,
                     lanes: *lanes,
+                    no_disk: args.no_disk,
                 };
 
                 let result = run_benchmark_with_progress(http, server, bench_args, 0).await;
@@ -177,7 +197,7 @@ pub async fn run_benchmark_matrix(
                         size_gib: *size_gib,
                         lanes: *lanes,
                         io_chunk_bytes: *io_chunk_bytes,
-                        file_path: file_path.display().to_string(),
+                        file_path: report.file_path.clone(),
                         success: true,
                         transfer_id: Some(report.transfer_id),
                         elapsed_ms: Some(report.elapsed_ms),
@@ -249,21 +269,29 @@ async fn run_benchmark_with_progress(
     progress_interval_secs: u64,
 ) -> Result<SendTransferReport> {
     let file_size_bytes = args.size_gib * 1024 * 1024 * 1024;
-    prepare_sparse_file(&args.file_path, file_size_bytes).await?;
-
     let file_name = args
         .file_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("metra-bench.bin")
         .to_owned();
-    let source_uri = format!("file://{}", args.file_path.display());
+    let source_uri = if args.no_disk {
+        format!("generated://zeros/{file_name}")
+    } else {
+        prepare_sparse_file(&args.file_path, file_size_bytes).await?;
+        format!("file://{}", args.file_path.display())
+    };
+    let destination_uri = if args.no_disk {
+        format!("null://benchmark/{file_name}")
+    } else {
+        args.destination_uri.clone()
+    };
 
     let create = CreateTransferRequest {
-        tenant_id: args.tenant_id,
-        user_id: args.user_id,
+        tenant_id: args.tenant_id.clone(),
+        user_id: args.user_id.clone(),
         source_uri,
-        destination_uri: args.destination_uri,
+        destination_uri,
         file_name,
         file_size_bytes,
         resume_chunk_size_bytes: RESUME_CHUNK_SIZE_BYTES,
@@ -275,15 +303,24 @@ async fn run_benchmark_with_progress(
         .map_err(|err| anyhow::anyhow!("invalid benchmark transfer request: {err}"))?;
     let created = create_transfer(http, server, &create).await?;
 
-    let send_args = SendArgs {
-        transfer_id: created.transfer_id,
-        file_path: args.file_path,
-        quic_addr: args.quic_addr,
-        io_chunk_bytes: args.io_chunk_bytes,
-        progress_interval_secs,
-        lanes: args.lanes,
+    let source = if args.no_disk {
+        PayloadSource::GeneratedZeros {
+            label: format!("generated://zeros/{file_size_bytes}"),
+        }
+    } else {
+        PayloadSource::File(args.file_path.clone())
     };
-    send_transfer(http, server, send_args).await
+    send_transfer_with_source(
+        http,
+        server,
+        created.transfer_id,
+        source,
+        args.quic_addr,
+        args.io_chunk_bytes,
+        progress_interval_secs,
+        args.lanes,
+    )
+    .await
 }
 
 pub async fn send_transfer(
@@ -291,23 +328,48 @@ pub async fn send_transfer(
     server: &str,
     args: SendArgs,
 ) -> Result<SendTransferReport> {
-    if args.io_chunk_bytes == 0 {
+    send_transfer_with_source(
+        http,
+        server,
+        args.transfer_id,
+        PayloadSource::File(args.file_path),
+        args.quic_addr,
+        args.io_chunk_bytes,
+        args.progress_interval_secs,
+        args.lanes,
+    )
+    .await
+}
+
+async fn send_transfer_with_source(
+    http: &Client,
+    server: &str,
+    transfer_id: Uuid,
+    source: PayloadSource,
+    quic_addr_override: Option<std::net::SocketAddr>,
+    io_chunk_bytes: usize,
+    progress_interval_secs: u64,
+    lanes: u32,
+) -> Result<SendTransferReport> {
+    if io_chunk_bytes == 0 {
         anyhow::bail!("io_chunk_bytes must be > 0");
     }
-    if args.lanes == 0 {
+    if lanes == 0 {
         anyhow::bail!("lanes must be > 0");
     }
 
-    let transfer = fetch_transfer_status(http, server, args.transfer_id).await?;
-    let file_metadata = fs::metadata(&args.file_path)
-        .await
-        .with_context(|| format!("failed reading file metadata {}", args.file_path.display()))?;
-    if file_metadata.len() != transfer.file_size_bytes {
-        anyhow::bail!(
-            "local file size {} does not match transfer size {}",
-            file_metadata.len(),
-            transfer.file_size_bytes
-        );
+    let transfer = fetch_transfer_status(http, server, transfer_id).await?;
+    if let PayloadSource::File(file_path) = &source {
+        let file_metadata = fs::metadata(file_path)
+            .await
+            .with_context(|| format!("failed reading file metadata {}", file_path.display()))?;
+        if file_metadata.len() != transfer.file_size_bytes {
+            anyhow::bail!(
+                "local file size {} does not match transfer size {}",
+                file_metadata.len(),
+                transfer.file_size_bytes
+            );
+        }
     }
 
     let cert_response = fetch_quic_certificate(http, server).await?;
@@ -319,25 +381,24 @@ pub async fn send_transfer(
         );
     }
     let quic_addr =
-        args.quic_addr
-            .unwrap_or(cert_response.quic_addr.parse().with_context(|| {
-                format!("invalid quic_addr from server: {}", cert_response.quic_addr)
-            })?);
+        quic_addr_override.unwrap_or(cert_response.quic_addr.parse().with_context(|| {
+            format!("invalid quic_addr from server: {}", cert_response.quic_addr)
+        })?);
 
     let (_endpoint, connection) = connect_quic(&cert_response, quic_addr).await?;
-    let lanes = normalized_lane_count(args.lanes, transfer.file_size_bytes);
+    let lanes = normalized_lane_count(lanes, transfer.file_size_bytes);
     let ranges = split_ranges(transfer.file_size_bytes, lanes);
 
     let started_at = Instant::now();
     let progress_bytes = Arc::new(AtomicU64::new(0));
     let stop_progress = Arc::new(AtomicBool::new(false));
-    let progress_task = if args.progress_interval_secs > 0 {
+    let progress_task = if progress_interval_secs > 0 {
         Some(tokio::spawn(report_progress(
             transfer.transfer_id,
             progress_bytes.clone(),
             stop_progress.clone(),
             started_at,
-            args.progress_interval_secs,
+            progress_interval_secs,
         )))
     } else {
         None
@@ -350,8 +411,8 @@ pub async fn send_transfer(
             file_size_bytes: transfer.file_size_bytes,
             file_name: transfer.file_name.clone(),
             resume_chunk_size_bytes: transfer.resume_chunk_size_bytes,
-            file_path: args.file_path.clone(),
-            io_chunk_bytes: args.io_chunk_bytes,
+            source: source.clone(),
+            io_chunk_bytes,
             lane_index: lane_index as u32,
             total_lanes: lanes,
             range_start,
@@ -394,7 +455,7 @@ pub async fn send_transfer(
 
     Ok(SendTransferReport {
         transfer_id: transfer.transfer_id,
-        file_path: args.file_path.display().to_string(),
+        file_path: source.label(),
         file_size_bytes: transfer.file_size_bytes,
         resumed_from_bytes,
         bytes_streamed_this_session,
@@ -447,38 +508,55 @@ async fn send_lane(
         );
     }
 
-    let mut file = fs::File::open(&lane.file_path)
-        .await
-        .with_context(|| format!("failed opening file {}", lane.file_path.display()))?;
-    file.seek(SeekFrom::Start(open_ack.resume_offset_bytes))
-        .await
-        .context("failed seeking local file for resume")?;
-
     let mut buffer = vec![0u8; lane.io_chunk_bytes];
     let mut remaining = lane.range_end_exclusive - open_ack.resume_offset_bytes;
     let mut bytes_streamed = 0u64;
 
-    while remaining > 0 {
-        let read_len = remaining.min(buffer.len() as u64) as usize;
-        let bytes_read = file
-            .read(&mut buffer[..read_len])
-            .await
-            .context("failed reading local file")?;
-        if bytes_read == 0 {
-            anyhow::bail!(
-                "unexpected EOF while sending lane {} (remaining {} bytes)",
-                lane.lane_index,
-                remaining
-            );
+    match &lane.source {
+        PayloadSource::File(file_path) => {
+            let mut file = fs::File::open(file_path)
+                .await
+                .with_context(|| format!("failed opening file {}", file_path.display()))?;
+            file.seek(SeekFrom::Start(open_ack.resume_offset_bytes))
+                .await
+                .context("failed seeking local file for resume")?;
+
+            while remaining > 0 {
+                let read_len = remaining.min(buffer.len() as u64) as usize;
+                let bytes_read = file
+                    .read(&mut buffer[..read_len])
+                    .await
+                    .context("failed reading local file")?;
+                if bytes_read == 0 {
+                    anyhow::bail!(
+                        "unexpected EOF while sending lane {} (remaining {} bytes)",
+                        lane.lane_index,
+                        remaining
+                    );
+                }
+                send_stream
+                    .write_all(&buffer[..bytes_read])
+                    .await
+                    .context("failed writing stream payload")?;
+                let written = bytes_read as u64;
+                remaining -= written;
+                bytes_streamed += written;
+                progress_bytes.fetch_add(written, Ordering::Relaxed);
+            }
         }
-        send_stream
-            .write_all(&buffer[..bytes_read])
-            .await
-            .context("failed writing stream payload")?;
-        let written = bytes_read as u64;
-        remaining -= written;
-        bytes_streamed += written;
-        progress_bytes.fetch_add(written, Ordering::Relaxed);
+        PayloadSource::GeneratedZeros { .. } => {
+            while remaining > 0 {
+                let to_send = remaining.min(buffer.len() as u64) as usize;
+                send_stream
+                    .write_all(&buffer[..to_send])
+                    .await
+                    .context("failed writing generated payload")?;
+                let written = to_send as u64;
+                remaining -= written;
+                bytes_streamed += written;
+                progress_bytes.fetch_add(written, Ordering::Relaxed);
+            }
+        }
     }
 
     send_stream.finish()?;
