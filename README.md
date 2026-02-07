@@ -132,6 +132,20 @@ cargo run --release -p metra-client -- --output json transfer compare \
   --cleanup-file
 ```
 
+Run a compare-series benchmark across multiple sizes:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer compare-series \
+  --sizes-gib 1,2 \
+  --file-dir /tmp \
+  --file-prefix metra-bench-compare-series \
+  --io-chunk-bytes 16777216 \
+  --lanes 2 \
+  --iterations 2 \
+  --json-out /tmp/metra-reports/compare-series-1g2g-i2.json \
+  --cleanup-files
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -155,6 +169,9 @@ cargo run --release -p metra-client -- --output json transfer compare \
   - disk p50 `~1.20 Gbps`, p95 `~1.23 Gbps`
   - no-disk p50 `~1.86 Gbps`, p95 `~1.89 Gbps`
   - delta p50 `~0.66 Gbps` (`+53.77%`), p95 `~0.67 Gbps` (`+55.55%`)
+- Compare-series run (1/2 GiB, 2 lanes, 16 MiB, 2 iterations each):
+  - 1 GiB p50: disk `~1.209 Gbps`, no-disk `~1.828 Gbps`, delta `~+51.18%`
+  - 2 GiB p50: disk `~1.201 Gbps`, no-disk `~1.833 Gbps`, delta `~+52.60%`
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -177,6 +194,7 @@ These measurements are local environment baselines and do not represent target W
 - [ ] Validate and tune lane scheduling for higher throughput under load.
 - [x] Add automated benchmark matrix for lane/chunk combinations (`transfer matrix`).
 - [x] Add repeated compare benchmark with p50/p95 reporting (`transfer compare --iterations`).
+- [x] Add multi-size compare benchmark series (`transfer compare-series`).
 
 ### Near-term Performance Roadmap
 

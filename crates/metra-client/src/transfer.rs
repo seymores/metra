@@ -24,7 +24,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    cli::{BenchArgs, CompareArgs, CreateArgs, MatrixArgs, SendArgs},
+    cli::{BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, SendArgs},
     quic::{connect_quic, read_json_frame, write_json_frame},
     rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
 };
@@ -85,6 +85,33 @@ pub struct BenchmarkCompareReport {
     delta_percent_over_disk: ThroughputStats,
     disk_fraction_of_no_disk: ThroughputStats,
     runs: Vec<BenchmarkCompareIteration>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkCompareSeriesReport {
+    server: String,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    sizes_gib: Vec<u64>,
+    lanes: u32,
+    io_chunk_bytes: usize,
+    iterations: u32,
+    total_sizes: usize,
+    best_disk_p50_size_gib: Option<u64>,
+    best_no_disk_p50_size_gib: Option<u64>,
+    largest_delta_p50_size_gib: Option<u64>,
+    rows: Vec<BenchmarkCompareSeriesRow>,
+    reports: Vec<BenchmarkCompareReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkCompareSeriesRow {
+    size_gib: u64,
+    disk_p50_gbps: f64,
+    no_disk_p50_gbps: f64,
+    delta_p50_gbps: f64,
+    delta_percent_p50: f64,
+    disk_fraction_p50: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,6 +446,99 @@ pub async fn run_benchmark_compare(
         write_json_file(&path, &report).await?;
     }
     Ok(report)
+}
+
+pub async fn run_benchmark_compare_series(
+    http: &Client,
+    server: &str,
+    args: CompareSeriesArgs,
+) -> Result<BenchmarkCompareSeriesReport> {
+    if args.sizes_gib.is_empty() {
+        anyhow::bail!("sizes_gib must contain at least one value");
+    }
+    if args.sizes_gib.iter().any(|size| *size == 0) {
+        anyhow::bail!("sizes_gib values must be > 0");
+    }
+    if args.lanes == 0 {
+        anyhow::bail!("lanes must be > 0");
+    }
+    if args.io_chunk_bytes == 0 {
+        anyhow::bail!("io_chunk_bytes must be > 0");
+    }
+    if args.iterations == 0 {
+        anyhow::bail!("iterations must be > 0");
+    }
+
+    let json_out = args.json_out.clone();
+    fs::create_dir_all(&args.file_dir).await.with_context(|| {
+        format!(
+            "failed creating benchmark compare-series directory {}",
+            args.file_dir.display()
+        )
+    })?;
+
+    let started_at = Utc::now();
+    let mut rows = Vec::with_capacity(args.sizes_gib.len());
+    let mut reports = Vec::with_capacity(args.sizes_gib.len());
+    let destination_prefix = args.destination_prefix.trim_end_matches('/').to_owned();
+
+    for size_gib in &args.sizes_gib {
+        let file_name = format!("{}-{}g.bin", args.file_prefix, size_gib);
+        let file_path = args.file_dir.join(&file_name);
+        let compare_args = CompareArgs {
+            size_gib: *size_gib,
+            file_path,
+            tenant_id: args.tenant_id.clone(),
+            user_id: args.user_id.clone(),
+            destination_uri: format!("{destination_prefix}/{file_name}"),
+            quic_addr: args.quic_addr,
+            io_chunk_bytes: args.io_chunk_bytes,
+            lanes: args.lanes,
+            iterations: args.iterations,
+            cleanup_file: args.cleanup_files,
+            json_out: None,
+        };
+        let report = run_benchmark_compare(http, server, compare_args).await?;
+        rows.push(BenchmarkCompareSeriesRow {
+            size_gib: *size_gib,
+            disk_p50_gbps: report.disk_backed.p50,
+            no_disk_p50_gbps: report.no_disk.p50,
+            delta_p50_gbps: report.delta_gbps.p50,
+            delta_percent_p50: report.delta_percent_over_disk.p50,
+            disk_fraction_p50: report.disk_fraction_of_no_disk.p50,
+        });
+        reports.push(report);
+    }
+
+    let series = BenchmarkCompareSeriesReport {
+        server: server.to_owned(),
+        started_at,
+        completed_at: Utc::now(),
+        sizes_gib: args.sizes_gib.clone(),
+        lanes: args.lanes,
+        io_chunk_bytes: args.io_chunk_bytes,
+        iterations: args.iterations,
+        total_sizes: rows.len(),
+        best_disk_p50_size_gib: rows
+            .iter()
+            .max_by(|left, right| left.disk_p50_gbps.total_cmp(&right.disk_p50_gbps))
+            .map(|row| row.size_gib),
+        best_no_disk_p50_size_gib: rows
+            .iter()
+            .max_by(|left, right| left.no_disk_p50_gbps.total_cmp(&right.no_disk_p50_gbps))
+            .map(|row| row.size_gib),
+        largest_delta_p50_size_gib: rows
+            .iter()
+            .max_by(|left, right| left.delta_p50_gbps.total_cmp(&right.delta_p50_gbps))
+            .map(|row| row.size_gib),
+        rows,
+        reports,
+    };
+
+    if let Some(path) = json_out {
+        write_json_file(&path, &series).await?;
+    }
+    Ok(series)
 }
 
 async fn run_benchmark_with_progress(

@@ -60,6 +60,12 @@ async fn main() -> Result<()> {
                 print_output(&report, cli.output)?;
                 Ok(())
             }
+            TransferAction::CompareSeries(args) => {
+                let report =
+                    transfer::run_benchmark_compare_series(&http, &cli.server, args).await?;
+                print_output(&report, cli.output)?;
+                Ok(())
+            }
         },
     }
 }

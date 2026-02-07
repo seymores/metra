@@ -39,6 +39,7 @@ pub enum TransferAction {
     Bench(BenchArgs),
     Matrix(MatrixArgs),
     Compare(CompareArgs),
+    CompareSeries(CompareSeriesArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -157,6 +158,34 @@ pub struct CompareArgs {
     pub iterations: u32,
     #[arg(long, default_value_t = true)]
     pub cleanup_file: bool,
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CompareSeriesArgs {
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4")]
+    pub sizes_gib: Vec<u64>,
+    #[arg(long, default_value = "/tmp")]
+    pub file_dir: PathBuf,
+    #[arg(long, default_value = "metra-bench-compare-series")]
+    pub file_prefix: String,
+    #[arg(long, default_value = "bench-tenant")]
+    pub tenant_id: String,
+    #[arg(long, default_value = "bench-user")]
+    pub user_id: String,
+    #[arg(long, default_value = "local://benchmark")]
+    pub destination_prefix: String,
+    #[arg(long)]
+    pub quic_addr: Option<SocketAddr>,
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    pub io_chunk_bytes: usize,
+    #[arg(long, default_value_t = 1)]
+    pub lanes: u32,
+    #[arg(long, default_value_t = 3)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = true)]
+    pub cleanup_files: bool,
     #[arg(long)]
     pub json_out: Option<PathBuf>,
 }
