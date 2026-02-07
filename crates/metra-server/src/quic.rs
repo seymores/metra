@@ -632,19 +632,45 @@ async fn receive_lane_payload_to_file_pipelined(
     mut file: fs::File,
     args: ReceiveLanePipelineArgs,
 ) -> Result<u64> {
-    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(RECEIVE_WRITE_PIPELINE_DEPTH);
+    #[derive(Debug)]
+    struct ReceivePipelineChunk {
+        buffer: Vec<u8>,
+        bytes_read: usize,
+    }
+
+    fn decrypt_payload_chunk_in_place(_payload: &mut [u8]) {
+        // QUIC already decrypts payload; keep a dedicated stage so app-level
+        // crypto/FEC transforms can be inserted without restructuring the pipeline.
+    }
+
+    let (buffer_pool_tx, mut buffer_pool_rx) =
+        mpsc::channel::<Vec<u8>>(RECEIVE_WRITE_PIPELINE_DEPTH);
+    for _ in 0..RECEIVE_WRITE_PIPELINE_DEPTH {
+        buffer_pool_tx
+            .send(vec![0u8; MAX_CHUNK_READ_BYTES])
+            .await
+            .map_err(|_| anyhow::anyhow!("failed seeding receive/write pipeline buffers"))?;
+    }
+
+    let (decrypt_tx, mut decrypt_rx) =
+        mpsc::channel::<ReceivePipelineChunk>(RECEIVE_WRITE_PIPELINE_DEPTH);
+    let (writer_tx, mut writer_rx) =
+        mpsc::channel::<ReceivePipelineChunk>(RECEIVE_WRITE_PIPELINE_DEPTH);
+
     let state_for_writer = state.clone();
     let writer_args = args.clone();
+    let buffer_pool_tx_for_writer = buffer_pool_tx.clone();
     let writer_task = tokio::spawn(async move {
         let mut bytes_written = 0u64;
         let mut since_update = 0u64;
         while let Some(chunk) = writer_rx.recv().await {
-            file.write_all(&chunk)
+            file.write_all(&chunk.buffer[..chunk.bytes_read])
                 .await
                 .context("failed writing transfer chunk to disk")?;
-            let chunk_len = chunk.len() as u64;
+            let chunk_len = chunk.bytes_read as u64;
             bytes_written += chunk_len;
             since_update += chunk_len;
+            let _ = buffer_pool_tx_for_writer.try_send(chunk.buffer);
 
             if since_update >= PROGRESS_UPDATE_INTERVAL_BYTES {
                 persist_progress(
@@ -676,6 +702,17 @@ async fn receive_lane_payload_to_file_pipelined(
         Ok::<u64, anyhow::Error>(bytes_written)
     });
 
+    let decrypt_task = tokio::spawn(async move {
+        while let Some(mut chunk) = decrypt_rx.recv().await {
+            decrypt_payload_chunk_in_place(&mut chunk.buffer[..chunk.bytes_read]);
+            writer_tx
+                .send(chunk)
+                .await
+                .map_err(|_| anyhow::anyhow!("writer stage channel unexpectedly closed"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
     let mut bytes_received = 0u64;
     let mut read_error: Option<anyhow::Error> = None;
     while bytes_received < args.expected_bytes {
@@ -700,13 +737,32 @@ async fn receive_lane_payload_to_file_pipelined(
             break;
         }
 
-        if writer_tx
-            .send(chunk.bytes[..to_write].to_vec())
+        let mut buffer = match buffer_pool_rx.recv().await {
+            Some(buffer) => buffer,
+            None => {
+                read_error = Some(anyhow::anyhow!(
+                    "receive buffer pool unexpectedly closed for transfer {} lane {}",
+                    args.transfer_id,
+                    args.lane_index
+                ));
+                break;
+            }
+        };
+        if buffer.len() < to_write {
+            buffer.resize(to_write, 0);
+        }
+        buffer[..to_write].copy_from_slice(&chunk.bytes[..to_write]);
+
+        if decrypt_tx
+            .send(ReceivePipelineChunk {
+                buffer,
+                bytes_read: to_write,
+            })
             .await
             .is_err()
         {
             read_error = Some(anyhow::anyhow!(
-                "writer pipeline closed unexpectedly for transfer {} lane {}",
+                "decrypt pipeline closed unexpectedly for transfer {} lane {}",
                 args.transfer_id,
                 args.lane_index
             ));
@@ -715,7 +771,11 @@ async fn receive_lane_payload_to_file_pipelined(
         bytes_received += to_write as u64;
     }
 
-    drop(writer_tx);
+    drop(decrypt_tx);
+    let decrypt_joined = decrypt_task
+        .await
+        .context("decrypt pipeline task panicked")?;
+    decrypt_joined?;
     let writer_joined = writer_task.await.context("writer pipeline task panicked")?;
     let bytes_written = writer_joined?;
 

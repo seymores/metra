@@ -2093,17 +2093,29 @@ async fn send_file_lane_pipelined(
         return Ok(0);
     }
 
-    let (buffer_tx, mut buffer_rx) = mpsc::channel::<Vec<u8>>(file_read_pipeline_depth);
+    #[derive(Debug)]
+    struct SendPipelineChunk {
+        buffer: Vec<u8>,
+        bytes_read: usize,
+    }
+
+    fn encrypt_payload_chunk_in_place(_payload: &mut [u8]) {
+        // QUIC already encrypts stream payload; keep a dedicated stage so app-level
+        // crypto/FEC transforms can be inserted without reshaping backpressure flow.
+    }
+
+    let (buffer_pool_tx, mut buffer_pool_rx) = mpsc::channel::<Vec<u8>>(file_read_pipeline_depth);
     for _ in 0..file_read_pipeline_depth {
-        buffer_tx
+        buffer_pool_tx
             .send(vec![0u8; io_chunk_bytes])
             .await
             .map_err(|_| anyhow::anyhow!("failed seeding file read pipeline buffers"))?;
     }
 
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<(Vec<u8>, usize)>(file_read_pipeline_depth);
+    let (read_tx, mut read_rx) = mpsc::channel::<SendPipelineChunk>(file_read_pipeline_depth);
+    let (encrypt_tx, mut encrypt_rx) = mpsc::channel::<SendPipelineChunk>(file_read_pipeline_depth);
     let file_path = file_path.to_path_buf();
-    let producer = tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         let mut file = fs::File::open(&file_path)
             .await
             .with_context(|| format!("failed opening file {}", file_path.display()))?;
@@ -2113,7 +2125,7 @@ async fn send_file_lane_pipelined(
 
         let mut remaining = total_bytes;
         while remaining > 0 {
-            let mut buffer = buffer_rx
+            let mut buffer = buffer_pool_rx
                 .recv()
                 .await
                 .context("file read pipeline buffer pool unexpectedly closed")?;
@@ -2129,10 +2141,22 @@ async fn send_file_lane_pipelined(
                     remaining
                 );
             }
-            chunk_tx.send((buffer, bytes_read)).await.map_err(|_| {
-                anyhow::anyhow!("file read pipeline chunk channel unexpectedly closed")
-            })?;
+            read_tx
+                .send(SendPipelineChunk { buffer, bytes_read })
+                .await
+                .map_err(|_| anyhow::anyhow!("file read stage channel unexpectedly closed"))?;
             remaining -= bytes_read as u64;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let encrypt_task = tokio::spawn(async move {
+        while let Some(mut chunk) = read_rx.recv().await {
+            encrypt_payload_chunk_in_place(&mut chunk.buffer[..chunk.bytes_read]);
+            encrypt_tx
+                .send(chunk)
+                .await
+                .map_err(|_| anyhow::anyhow!("file encrypt stage channel unexpectedly closed"))?;
         }
         Ok::<_, anyhow::Error>(())
     });
@@ -2142,19 +2166,19 @@ async fn send_file_lane_pipelined(
         let mut bytes_streamed = 0u64;
 
         while remaining > 0 {
-            let (buffer, bytes_read) = chunk_rx
+            let chunk = encrypt_rx
                 .recv()
                 .await
                 .context("file read pipeline ended before lane completion")?;
             send_stream
-                .write_all(&buffer[..bytes_read])
+                .write_all(&chunk.buffer[..chunk.bytes_read])
                 .await
                 .context("failed writing stream payload")?;
-            let written = bytes_read as u64;
+            let written = chunk.bytes_read as u64;
             remaining = remaining.saturating_sub(written);
             bytes_streamed += written;
             progress_bytes.fetch_add(written, Ordering::Relaxed);
-            let _ = buffer_tx.send(buffer).await;
+            let _ = buffer_pool_tx.send(chunk.buffer).await;
         }
 
         if bytes_streamed != total_bytes {
@@ -2171,13 +2195,21 @@ async fn send_file_lane_pipelined(
 
     match consume_result {
         Ok(bytes_streamed) => {
-            let producer_result = producer.await.context("file read pipeline task panicked")?;
-            producer_result?;
+            let reader_result = reader_task
+                .await
+                .context("file read pipeline task panicked")?;
+            reader_result?;
+            let encrypt_result = encrypt_task
+                .await
+                .context("file encrypt pipeline task panicked")?;
+            encrypt_result?;
             Ok(bytes_streamed)
         }
         Err(err) => {
-            producer.abort();
-            let _ = producer.await;
+            reader_task.abort();
+            encrypt_task.abort();
+            let _ = reader_task.await;
+            let _ = encrypt_task.await;
             Err(err)
         }
     }
