@@ -64,6 +64,8 @@ cargo run -p metra-client -- health --output json
 cargo run -p metra-client -- tui
 ```
 
+![Metra Client TUI](docs/metra-client.png)
+
 TUI keys:
 - `r`: refresh health
 - `b`: run benchmark with current TUI benchmark config
