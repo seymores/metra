@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use metra_proto::{
     CreateTransferRequest, QUIC_PROTOCOL_VERSION, QuicTransferCompleteAck, QuicTransferOpen,
-    QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES,
+    QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES, TransferStatus,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::{
     cli::{
         BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, MatrixProfilesArgs,
-        SendArgs, TuneLanesArgs,
+        RuntimeProfile, SendArgs, TuneLanesArgs, TuneRuntimeArgs,
     },
     lane_policy::{
         LanePolicyEntry, WorkloadProfile, read_lane_policy, select_lane_policy,
@@ -44,6 +44,10 @@ pub struct SendTransferReport {
     file_path: String,
     file_size_bytes: u64,
     effective_lanes: u32,
+    runtime_profile: Option<String>,
+    effective_io_chunk_bytes: usize,
+    file_read_pipeline_depth: usize,
+    runtime_selection: Option<String>,
     lane_selection: Option<String>,
     resumed_from_bytes: u64,
     bytes_streamed_this_session: u64,
@@ -59,6 +63,10 @@ pub struct BenchmarkMatrixRun {
     size_gib: u64,
     lanes: u32,
     effective_lanes: Option<u32>,
+    runtime_profile: Option<String>,
+    effective_io_chunk_bytes: Option<usize>,
+    file_read_pipeline_depth: Option<usize>,
+    runtime_selection: Option<String>,
     lane_selection: Option<String>,
     io_chunk_bytes: usize,
     file_path: String,
@@ -186,6 +194,41 @@ pub struct TuneLanesRun {
 }
 
 #[derive(Debug, Serialize)]
+pub struct TuneRuntimeReport {
+    server: String,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    size_gib: u64,
+    lanes: u32,
+    iterations: u32,
+    no_disk: bool,
+    recommended_profile: Option<String>,
+    profiles: Vec<TuneRuntimeProfileResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TuneRuntimeProfileResult {
+    runtime_profile: String,
+    effective_io_chunk_bytes: Option<usize>,
+    file_read_pipeline_depth: Option<usize>,
+    runtime_selection: Option<String>,
+    throughput_gbps: ThroughputStats,
+    successful_runs: u32,
+    failed_runs: u32,
+    runs: Vec<TuneRuntimeRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TuneRuntimeRun {
+    iteration: u32,
+    transfer_id: Option<Uuid>,
+    average_gbps: Option<f64>,
+    elapsed_ms: Option<u128>,
+    final_status: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct BenchmarkCompareSeriesRow {
     size_gib: u64,
     disk_p50_gbps: f64,
@@ -249,6 +292,7 @@ struct LaneConfig {
     resume_chunk_size_bytes: u64,
     source: PayloadSource,
     io_chunk_bytes: usize,
+    file_read_pipeline_depth: usize,
     lane_index: u32,
     total_lanes: u32,
     range_start: u64,
@@ -276,7 +320,22 @@ struct LaneTransferResult {
     complete_ack: QuicTransferCompleteAck,
 }
 
-const FILE_READ_PIPELINE_DEPTH: usize = 4;
+const DEFAULT_IO_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_FILE_READ_PIPELINE_DEPTH: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimePreset {
+    io_chunk_bytes: usize,
+    file_read_pipeline_depth: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeTuning {
+    runtime_profile: Option<RuntimeProfile>,
+    effective_io_chunk_bytes: usize,
+    file_read_pipeline_depth: usize,
+    runtime_selection: Option<String>,
+}
 
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -298,6 +357,102 @@ pub fn create_transfer_request(args: &CreateArgs) -> Result<CreateTransferReques
         .validate()
         .map_err(|err| anyhow::anyhow!("invalid transfer request: {err}"))?;
     Ok(request)
+}
+
+fn runtime_preset(profile: RuntimeProfile) -> RuntimePreset {
+    match profile {
+        RuntimeProfile::Balanced => RuntimePreset {
+            io_chunk_bytes: DEFAULT_IO_CHUNK_BYTES,
+            file_read_pipeline_depth: 4,
+        },
+        RuntimeProfile::Throughput => RuntimePreset {
+            io_chunk_bytes: 16 * 1024 * 1024,
+            file_read_pipeline_depth: 8,
+        },
+        RuntimeProfile::LowCpu => RuntimePreset {
+            io_chunk_bytes: 4 * 1024 * 1024,
+            file_read_pipeline_depth: 2,
+        },
+    }
+}
+
+fn resolve_runtime_tuning(
+    runtime_profile: Option<RuntimeProfile>,
+    requested_io_chunk_bytes: usize,
+    requested_file_read_pipeline_depth: Option<usize>,
+) -> Result<RuntimeTuning> {
+    if requested_io_chunk_bytes == 0 {
+        anyhow::bail!("io_chunk_bytes must be > 0");
+    }
+    if let Some(depth) = requested_file_read_pipeline_depth
+        && depth == 0
+    {
+        anyhow::bail!("file_read_pipeline_depth must be > 0");
+    }
+
+    let preset = runtime_profile.map(runtime_preset);
+    let effective_io_chunk_bytes = if let Some(preset) = preset {
+        if requested_io_chunk_bytes == DEFAULT_IO_CHUNK_BYTES {
+            preset.io_chunk_bytes
+        } else {
+            requested_io_chunk_bytes
+        }
+    } else {
+        requested_io_chunk_bytes
+    };
+    let file_read_pipeline_depth = requested_file_read_pipeline_depth.unwrap_or_else(|| {
+        preset
+            .map(|value| value.file_read_pipeline_depth)
+            .unwrap_or(DEFAULT_FILE_READ_PIPELINE_DEPTH)
+    });
+
+    let runtime_selection = runtime_profile.map(|profile| {
+        format!(
+            "runtime-profile={} io_chunk_bytes={} file_read_pipeline_depth={}",
+            profile.as_str(),
+            effective_io_chunk_bytes,
+            file_read_pipeline_depth
+        )
+    });
+
+    Ok(RuntimeTuning {
+        runtime_profile,
+        effective_io_chunk_bytes,
+        file_read_pipeline_depth,
+        runtime_selection,
+    })
+}
+
+fn transfer_status_priority(status: TransferStatus) -> u8 {
+    match status {
+        TransferStatus::Queued => 0,
+        TransferStatus::Running => 1,
+        TransferStatus::Completed => 2,
+        TransferStatus::Failed => 3,
+    }
+}
+
+fn choose_preferred_complete_ack(
+    current: Option<QuicTransferCompleteAck>,
+    candidate: QuicTransferCompleteAck,
+) -> QuicTransferCompleteAck {
+    match current {
+        None => candidate,
+        Some(existing) => {
+            let candidate_priority = transfer_status_priority(candidate.status);
+            let existing_priority = transfer_status_priority(existing.status);
+            if candidate_priority > existing_priority
+                || (candidate_priority == existing_priority
+                    && (candidate.bytes_received > existing.bytes_received
+                        || (candidate.bytes_received == existing.bytes_received
+                            && candidate.updated_at > existing.updated_at)))
+            {
+                candidate
+            } else {
+                existing
+            }
+        }
+    }
 }
 
 pub async fn run_benchmark(
@@ -364,6 +519,8 @@ pub async fn run_benchmark_matrix(
                     no_disk: args.no_disk,
                     auto_lanes_report: args.auto_lanes_report.clone(),
                     lane_policy: args.lane_policy.clone(),
+                    runtime_profile: args.runtime_profile,
+                    file_read_pipeline_depth: args.file_read_pipeline_depth,
                 };
 
                 let result = run_benchmark_with_progress(http, server, bench_args, 0).await;
@@ -372,6 +529,10 @@ pub async fn run_benchmark_matrix(
                         size_gib: *size_gib,
                         lanes: *lanes,
                         effective_lanes: Some(report.effective_lanes),
+                        runtime_profile: report.runtime_profile.clone(),
+                        effective_io_chunk_bytes: Some(report.effective_io_chunk_bytes),
+                        file_read_pipeline_depth: Some(report.file_read_pipeline_depth),
+                        runtime_selection: report.runtime_selection.clone(),
                         lane_selection: report.lane_selection.clone(),
                         io_chunk_bytes: *io_chunk_bytes,
                         file_path: report.file_path.clone(),
@@ -387,6 +548,10 @@ pub async fn run_benchmark_matrix(
                         size_gib: *size_gib,
                         lanes: *lanes,
                         effective_lanes: None,
+                        runtime_profile: None,
+                        effective_io_chunk_bytes: None,
+                        file_read_pipeline_depth: None,
+                        runtime_selection: None,
                         lane_selection: None,
                         io_chunk_bytes: *io_chunk_bytes,
                         file_path: file_path.display().to_string(),
@@ -570,6 +735,8 @@ pub async fn run_benchmark_compare(
             no_disk: false,
             auto_lanes_report: None,
             lane_policy: None,
+            runtime_profile: None,
+            file_read_pipeline_depth: None,
         };
         let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
         let host_after_disk = telemetry.sample();
@@ -586,6 +753,8 @@ pub async fn run_benchmark_compare(
             no_disk: true,
             auto_lanes_report: None,
             lane_policy: None,
+            runtime_profile: None,
+            file_read_pipeline_depth: None,
         };
         let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
         let host_after_no_disk = telemetry.sample();
@@ -876,6 +1045,8 @@ pub async fn run_tune_lanes_under_load(
                         0,
                         lanes,
                         None,
+                        None,
+                        None,
                     )
                     .await
                 });
@@ -977,6 +1148,164 @@ pub async fn run_tune_lanes_under_load(
     }
     if let Some(path) = args.lane_policy_out.as_ref() {
         persist_tune_lanes_policy(path, args.json_out.as_deref(), &report).await?;
+    }
+    Ok(report)
+}
+
+pub async fn run_tune_runtime_profiles(
+    http: &Client,
+    server: &str,
+    args: TuneRuntimeArgs,
+) -> Result<TuneRuntimeReport> {
+    if args.size_gib == 0 {
+        anyhow::bail!("size_gib must be > 0");
+    }
+    if args.lanes == 0 {
+        anyhow::bail!("lanes must be > 0");
+    }
+    if args.iterations == 0 {
+        anyhow::bail!("iterations must be > 0");
+    }
+    if args.io_chunk_bytes == 0 {
+        anyhow::bail!("io_chunk_bytes must be > 0");
+    }
+    if args.profiles.is_empty() {
+        anyhow::bail!("profiles must contain at least one value");
+    }
+    if let Some(depth) = args.file_read_pipeline_depth
+        && depth == 0
+    {
+        anyhow::bail!("file_read_pipeline_depth must be > 0");
+    }
+
+    let mut profiles = Vec::new();
+    for profile in args.profiles.iter().copied() {
+        if !profiles.contains(&profile) {
+            profiles.push(profile);
+        }
+    }
+
+    let destination_prefix = if args.no_disk {
+        "null://benchmark/tune-runtime".to_owned()
+    } else {
+        args.destination_prefix.trim_end_matches('/').to_owned()
+    };
+    if !args.no_disk {
+        let file_size_bytes = args.size_gib * 1024 * 1024 * 1024;
+        prepare_sparse_file(&args.file_path, file_size_bytes).await?;
+    }
+
+    let started_at = Utc::now();
+    let mut profile_results = Vec::with_capacity(profiles.len());
+    for profile in profiles.iter().copied() {
+        let mut runs = Vec::with_capacity(args.iterations as usize);
+        let mut throughput_values = Vec::with_capacity(args.iterations as usize);
+        let mut successful_runs = 0u32;
+        let mut failed_runs = 0u32;
+        let mut runtime_selection: Option<String> = None;
+        let mut effective_io_chunk_bytes: Option<usize> = None;
+        let mut file_read_pipeline_depth: Option<usize> = None;
+
+        for iteration in 1..=args.iterations {
+            let file_name = format!(
+                "{}-{}-{}g-it{}.bin",
+                args.file_prefix,
+                profile.as_str(),
+                args.size_gib,
+                iteration
+            );
+            let bench_args = BenchArgs {
+                size_gib: args.size_gib,
+                file_path: args.file_path.clone(),
+                tenant_id: args.tenant_id.clone(),
+                user_id: args.user_id.clone(),
+                destination_uri: format!("{destination_prefix}/{file_name}"),
+                quic_addr: args.quic_addr,
+                io_chunk_bytes: args.io_chunk_bytes,
+                lanes: args.lanes,
+                no_disk: args.no_disk,
+                auto_lanes_report: None,
+                lane_policy: None,
+                runtime_profile: Some(profile),
+                file_read_pipeline_depth: args.file_read_pipeline_depth,
+            };
+            match run_benchmark_with_progress(http, server, bench_args, 0).await {
+                Ok(report) => {
+                    successful_runs += 1;
+                    throughput_values.push(report.average_gbps);
+                    runtime_selection = report.runtime_selection.clone();
+                    effective_io_chunk_bytes = Some(report.effective_io_chunk_bytes);
+                    file_read_pipeline_depth = Some(report.file_read_pipeline_depth);
+                    runs.push(TuneRuntimeRun {
+                        iteration,
+                        transfer_id: Some(report.transfer_id),
+                        average_gbps: Some(report.average_gbps),
+                        elapsed_ms: Some(report.elapsed_ms),
+                        final_status: Some(report.final_status),
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    failed_runs += 1;
+                    runs.push(TuneRuntimeRun {
+                        iteration,
+                        transfer_id: None,
+                        average_gbps: None,
+                        elapsed_ms: None,
+                        final_status: None,
+                        error: Some(err.to_string()),
+                    });
+                }
+            }
+        }
+
+        profile_results.push(TuneRuntimeProfileResult {
+            runtime_profile: profile.as_str().to_owned(),
+            effective_io_chunk_bytes,
+            file_read_pipeline_depth,
+            runtime_selection,
+            throughput_gbps: summarize_values(&throughput_values),
+            successful_runs,
+            failed_runs,
+            runs,
+        });
+    }
+
+    if args.cleanup_file && !args.no_disk {
+        match fs::remove_file(&args.file_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "failed to clean runtime tuning source file {}: {}",
+                    args.file_path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    let report = TuneRuntimeReport {
+        server: server.to_owned(),
+        started_at,
+        completed_at: Utc::now(),
+        size_gib: args.size_gib,
+        lanes: args.lanes,
+        iterations: args.iterations,
+        no_disk: args.no_disk,
+        recommended_profile: profile_results
+            .iter()
+            .filter(|profile| profile.successful_runs > 0)
+            .max_by(|left, right| {
+                left.throughput_gbps
+                    .p50
+                    .total_cmp(&right.throughput_gbps.p50)
+            })
+            .map(|profile| profile.runtime_profile.clone()),
+        profiles: profile_results,
+    };
+    if let Some(path) = args.json_out.as_ref() {
+        write_json_file(path, &report).await?;
     }
     Ok(report)
 }
@@ -1179,6 +1508,8 @@ async fn run_benchmark_with_progress(
         progress_interval_secs,
         selected_lanes,
         lane_selection,
+        args.runtime_profile,
+        args.file_read_pipeline_depth,
     )
     .await
 }
@@ -1198,6 +1529,8 @@ pub async fn send_transfer(
         args.progress_interval_secs,
         args.lanes,
         None,
+        args.runtime_profile,
+        args.file_read_pipeline_depth,
     )
     .await
 }
@@ -1212,13 +1545,14 @@ async fn send_transfer_with_source(
     progress_interval_secs: u64,
     lanes: u32,
     lane_selection: Option<String>,
+    runtime_profile: Option<RuntimeProfile>,
+    file_read_pipeline_depth: Option<usize>,
 ) -> Result<SendTransferReport> {
-    if io_chunk_bytes == 0 {
-        anyhow::bail!("io_chunk_bytes must be > 0");
-    }
     if lanes == 0 {
         anyhow::bail!("lanes must be > 0");
     }
+    let runtime_tuning =
+        resolve_runtime_tuning(runtime_profile, io_chunk_bytes, file_read_pipeline_depth)?;
 
     let transfer = fetch_transfer_status(http, server, transfer_id).await?;
     if let PayloadSource::File(file_path) = &source {
@@ -1274,7 +1608,8 @@ async fn send_transfer_with_source(
             file_name: transfer.file_name.clone(),
             resume_chunk_size_bytes: transfer.resume_chunk_size_bytes,
             source: source.clone(),
-            io_chunk_bytes,
+            io_chunk_bytes: runtime_tuning.effective_io_chunk_bytes,
+            file_read_pipeline_depth: runtime_tuning.file_read_pipeline_depth,
             lane_index: lane_index as u32,
             total_lanes: lanes,
             range_start,
@@ -1294,12 +1629,10 @@ async fn send_transfer_with_source(
             let lane_result = joined.context("lane task panicked")??;
             bytes_streamed_this_session += lane_result.bytes_streamed;
             resumed_from_bytes += lane_result.resumed_from_bytes;
-            if best_ack
-                .as_ref()
-                .is_none_or(|ack| lane_result.complete_ack.bytes_received > ack.bytes_received)
-            {
-                best_ack = Some(lane_result.complete_ack);
-            }
+            best_ack = Some(choose_preferred_complete_ack(
+                best_ack,
+                lane_result.complete_ack,
+            ));
         }
 
         let complete_ack = best_ack.context("no completion ack received from server")?;
@@ -1330,6 +1663,12 @@ async fn send_transfer_with_source(
         file_path: source.label(),
         file_size_bytes: transfer.file_size_bytes,
         effective_lanes: lanes,
+        runtime_profile: runtime_tuning
+            .runtime_profile
+            .map(|profile| profile.as_str().to_owned()),
+        effective_io_chunk_bytes: runtime_tuning.effective_io_chunk_bytes,
+        file_read_pipeline_depth: runtime_tuning.file_read_pipeline_depth,
+        runtime_selection: runtime_tuning.runtime_selection.clone(),
         lane_selection,
         resumed_from_bytes,
         bytes_streamed_this_session,
@@ -1390,6 +1729,7 @@ async fn send_lane(
                 open_ack.resume_offset_bytes,
                 lane.range_end_exclusive,
                 lane.io_chunk_bytes,
+                lane.file_read_pipeline_depth,
                 lane.lane_index,
                 progress_bytes.clone(),
             )
@@ -1422,6 +1762,7 @@ async fn send_file_lane_pipelined(
     resume_offset: u64,
     range_end_exclusive: u64,
     io_chunk_bytes: usize,
+    file_read_pipeline_depth: usize,
     lane_index: u32,
     progress_bytes: Arc<AtomicU64>,
 ) -> Result<u64> {
@@ -1430,15 +1771,15 @@ async fn send_file_lane_pipelined(
         return Ok(0);
     }
 
-    let (buffer_tx, mut buffer_rx) = mpsc::channel::<Vec<u8>>(FILE_READ_PIPELINE_DEPTH);
-    for _ in 0..FILE_READ_PIPELINE_DEPTH {
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<Vec<u8>>(file_read_pipeline_depth);
+    for _ in 0..file_read_pipeline_depth {
         buffer_tx
             .send(vec![0u8; io_chunk_bytes])
             .await
             .map_err(|_| anyhow::anyhow!("failed seeding file read pipeline buffers"))?;
     }
 
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<(Vec<u8>, usize)>(FILE_READ_PIPELINE_DEPTH);
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<(Vec<u8>, usize)>(file_read_pipeline_depth);
     let file_path = file_path.to_path_buf();
     let producer = tokio::spawn(async move {
         let mut file = fs::File::open(&file_path)
@@ -1730,4 +2071,63 @@ async fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .await
         .with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    use super::*;
+
+    fn ack(
+        status: TransferStatus,
+        bytes_received: u64,
+        seconds_offset: i64,
+    ) -> QuicTransferCompleteAck {
+        QuicTransferCompleteAck {
+            ok: status == TransferStatus::Completed,
+            status,
+            bytes_received,
+            message: format!("status={status:?}"),
+            updated_at: Utc::now() + ChronoDuration::seconds(seconds_offset),
+        }
+    }
+
+    #[test]
+    fn prefers_terminal_status_over_running_when_bytes_tie() {
+        let running = ack(TransferStatus::Running, 1024, 0);
+        let completed = ack(TransferStatus::Completed, 1024, 1);
+        let selected = choose_preferred_complete_ack(Some(running), completed.clone());
+        assert_eq!(selected.status, TransferStatus::Completed);
+        assert_eq!(selected.bytes_received, completed.bytes_received);
+    }
+
+    #[test]
+    fn prefers_failed_over_completed_to_surface_errors() {
+        let completed = ack(TransferStatus::Completed, 4096, 0);
+        let failed = ack(TransferStatus::Failed, 4096, 1);
+        let selected = choose_preferred_complete_ack(Some(completed), failed.clone());
+        assert_eq!(selected.status, TransferStatus::Failed);
+    }
+
+    #[test]
+    fn runtime_profile_overrides_default_chunk_and_depth_when_not_explicit() {
+        let tuning = resolve_runtime_tuning(
+            Some(RuntimeProfile::Throughput),
+            DEFAULT_IO_CHUNK_BYTES,
+            None,
+        )
+        .expect("runtime tuning should resolve");
+        assert_eq!(tuning.effective_io_chunk_bytes, 16 * 1024 * 1024);
+        assert_eq!(tuning.file_read_pipeline_depth, 8);
+    }
+
+    #[test]
+    fn explicit_chunk_value_is_preserved_with_profile() {
+        let tuning =
+            resolve_runtime_tuning(Some(RuntimeProfile::Throughput), 32 * 1024 * 1024, Some(6))
+                .expect("runtime tuning should resolve");
+        assert_eq!(tuning.effective_io_chunk_bytes, 32 * 1024 * 1024);
+        assert_eq!(tuning.file_read_pipeline_depth, 6);
+    }
 }

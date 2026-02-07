@@ -500,6 +500,18 @@ async fn handle_quic_stream(
     };
     lane_metrics.add_bytes(stream_bytes_written);
 
+    if striped && discard_payload {
+        persist_progress(
+            &state,
+            open.transfer_id,
+            true,
+            &checkpoint_path,
+            open.lane_index,
+            resume_offset + stream_bytes_written,
+        )
+        .await?;
+    }
+
     let complete = if striped {
         finalize_if_ready(
             &state,

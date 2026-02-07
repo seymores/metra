@@ -131,6 +131,22 @@ cargo run --release -p metra-client -- --output json transfer matrix-profiles \
 If `--servers` is omitted, all profiles run against the global `--server`. Output includes
 `detected_profile`, `profile_match`, and `profile_note` from `/health`.
 
+Run runtime profile sweep (`balanced`, `throughput`, `low-cpu`) and get recommended profile by p50 throughput:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer tune-runtime \
+  --size-gib 1 \
+  --lanes 2 \
+  --iterations 2 \
+  --io-chunk-bytes 8388608 \
+  --no-disk \
+  --json-out /tmp/metra-reports/tune-runtime-1g-l2.json
+```
+
+`transfer send`, `transfer bench`, and `transfer matrix` also accept:
+- `--runtime-profile balanced|throughput|low-cpu`
+- `--file-read-pipeline-depth <N>`
+
 Run a no-disk benchmark (client generates payload, server uses null sink) to isolate transfer-path overhead from filesystem I/O:
 
 ```bash
@@ -242,6 +258,13 @@ cargo run --release -p metra-client -- --output json transfer bench \
 - Compare-series telemetry sample (1 GiB, 2 lanes, 1 iteration): host snapshots include
   start/after-disk/after-no-disk CPU, memory, load-average, process CPU, and process memory
   with total deltas embedded in report JSON.
+- Compare run (1 GiB, 2 lanes, 16 MiB, 2 iterations, post striped-null finalize fix):
+  - disk p50 `~1.303 Gbps`, p95 `~1.304 Gbps`
+  - no-disk p50 `~2.168 Gbps`, p95 `~2.171 Gbps`
+  - delta p50 `~0.865 Gbps` (`+66.40%`)
+- Runtime tuning sample (1 GiB, 2 lanes, no-disk, 1 iteration/profile):
+  - balanced `~2.043 Gbps`, throughput `~2.034 Gbps`, low-cpu `~2.045 Gbps`
+  - recommended profile: `low-cpu` (on this machine)
 - Tune-lanes run (1 GiB, concurrency=2, no-disk, lanes=1/2, 1 iteration):
   - recommended lanes: `2`
   - lane 1 aggregate: `~1.90 Gbps`
@@ -307,6 +330,8 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - [x] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
 - [x] Add lane-policy persistence by workload profile (size/concurrency) and automatic fallback.
 - [x] Add server QUIC transport profiles (`--quic-profile lan|wan|high-bdp`).
+- [x] Add runtime profile presets and profile-sweep benchmark (`transfer tune-runtime`).
+- [x] Fix striped null-sink transfer completion/status accounting (`--no-disk` multi-lane).
 
 ### Near-term Performance Roadmap
 
@@ -314,7 +339,8 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
   - Client file-source read/send path now uses bounded pipelining with backpressure and buffer reuse.
   - Server receive/write path now uses bounded read->write pipelining with backpressure.
 - [x] Add per-lane and aggregate throughput metrics via OpenTelemetry.
-- [ ] Add CPU and runtime tuning profile (thread affinity, buffer sizing).
+- [x] Add CPU/runtime tuning profile presets (chunk + pipeline depth) and sweep command.
+- [ ] Add adaptive runtime auto-selection from persisted tune-runtime profiles.
 - [ ] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.
 - [x] Add automated benchmark profile sweep (`transfer matrix-profiles`) with profile detection.
 

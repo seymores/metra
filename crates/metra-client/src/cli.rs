@@ -17,6 +17,23 @@ pub enum QuicProfile {
     HighBdp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeProfile {
+    Balanced,
+    Throughput,
+    LowCpu,
+}
+
+impl RuntimeProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Throughput => "throughput",
+            Self::LowCpu => "low-cpu",
+        }
+    }
+}
+
 impl QuicProfile {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -56,6 +73,7 @@ pub enum TransferAction {
     Bench(BenchArgs),
     Matrix(MatrixArgs),
     MatrixProfiles(MatrixProfilesArgs),
+    TuneRuntime(TuneRuntimeArgs),
     Compare(CompareArgs),
     CompareSeries(CompareSeriesArgs),
     TuneLanes(TuneLanesArgs),
@@ -103,6 +121,10 @@ pub struct SendArgs {
     pub progress_interval_secs: u64,
     #[arg(long, default_value_t = 1)]
     pub lanes: u32,
+    #[arg(long, value_enum)]
+    pub runtime_profile: Option<RuntimeProfile>,
+    #[arg(long)]
+    pub file_read_pipeline_depth: Option<usize>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -129,6 +151,10 @@ pub struct BenchArgs {
     pub auto_lanes_report: Option<PathBuf>,
     #[arg(long)]
     pub lane_policy: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub runtime_profile: Option<RuntimeProfile>,
+    #[arg(long)]
+    pub file_read_pipeline_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -161,6 +187,10 @@ pub struct MatrixArgs {
     pub auto_lanes_report: Option<PathBuf>,
     #[arg(long)]
     pub lane_policy: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub runtime_profile: Option<RuntimeProfile>,
+    #[arg(long)]
+    pub file_read_pipeline_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -171,6 +201,44 @@ pub struct MatrixProfilesArgs {
     pub servers: Vec<String>,
     #[command(flatten)]
     pub matrix: MatrixArgs,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TuneRuntimeArgs {
+    #[arg(long, default_value_t = 1)]
+    pub size_gib: u64,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "balanced,throughput,low-cpu"
+    )]
+    pub profiles: Vec<RuntimeProfile>,
+    #[arg(long, default_value_t = 2)]
+    pub lanes: u32,
+    #[arg(long, default_value_t = 2)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    pub io_chunk_bytes: usize,
+    #[arg(long, default_value_t = true)]
+    pub no_disk: bool,
+    #[arg(long, default_value = "/tmp/metra-tune-runtime.bin")]
+    pub file_path: PathBuf,
+    #[arg(long, default_value = "metra-tune-runtime")]
+    pub file_prefix: String,
+    #[arg(long, default_value = "bench-tenant")]
+    pub tenant_id: String,
+    #[arg(long, default_value = "bench-user")]
+    pub user_id: String,
+    #[arg(long, default_value = "local://benchmark/tune-runtime")]
+    pub destination_prefix: String,
+    #[arg(long)]
+    pub quic_addr: Option<SocketAddr>,
+    #[arg(long)]
+    pub file_read_pipeline_depth: Option<usize>,
+    #[arg(long, default_value_t = true)]
+    pub cleanup_file: bool,
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
