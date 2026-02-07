@@ -12,7 +12,7 @@ use clap::Parser;
 use reqwest::Client;
 
 use crate::{
-    cli::{Cli, Command, TransferAction},
+    cli::{Cli, Command, TransferAction, TuiArgs},
     output::print_output,
 };
 
@@ -22,8 +22,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let http = Client::new();
 
-    match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => tui::run_tui(&http, &cli.server).await,
+    match cli.command.unwrap_or(Command::Tui(TuiArgs::default())) {
+        Command::Tui(args) => tui::run_tui(&http, &cli.server, args).await,
         Command::Health => {
             let health = rest::fetch_health(&http, &cli.server).await?;
             print_output(&health, cli.output)?;

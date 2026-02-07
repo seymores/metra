@@ -1,0 +1,73 @@
+name: Benchmark Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  runtime-profile-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release -p metra-server -p metra-client
+
+      - name: Start metra-server
+        run: |
+          mkdir -p /tmp/metra-data
+          target/release/metra-server \
+            --rest-addr 127.0.0.1:8080 \
+            --quic-addr 127.0.0.1:8443 \
+            --data-dir /tmp/metra-data \
+            --quic-profile lan > /tmp/metra-server.log 2>&1 &
+          echo $! > /tmp/metra-server.pid
+
+      - name: Wait for server health
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed health check" >&2
+          exit 1
+
+      - name: Run runtime tuning benchmark
+        run: |
+          mkdir -p /tmp/metra-reports
+          target/release/metra-client --server http://127.0.0.1:8080 --output json transfer tune-runtime \
+            --size-gib 1 \
+            --lanes 2 \
+            --iterations 1 \
+            --io-chunk-bytes 8388608 \
+            --no-disk \
+            --json-out /tmp/metra-reports/tune-runtime-ci.json
+
+      - name: Check runtime profile regression gate
+        run: |
+          python3 scripts/ci/benchmark_gate.py \
+            --report /tmp/metra-reports/tune-runtime-ci.json \
+            --baseline ci/benchmark-baseline.json
+
+      - name: Dump server log on failure
+        if: failure()
+        run: |
+          echo "==== metra-server.log ===="
+          cat /tmp/metra-server.log || true
+
+      - name: Stop metra-server
+        if: always()
+        run: |
+          if [ -f /tmp/metra-server.pid ]; then
+            kill "$(cat /tmp/metra-server.pid)" || true
+          fi

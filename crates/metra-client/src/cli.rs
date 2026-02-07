@@ -57,7 +57,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Tui,
+    Tui(TuiArgs),
     Health,
     Transfer {
         #[command(subcommand)]
@@ -107,6 +107,38 @@ pub struct StatusArgs {
     pub transfer_id: Uuid,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub struct TuiArgs {
+    #[arg(long, default_value_t = 1)]
+    pub bench_size_gib: u64,
+    #[arg(long, default_value_t = 2)]
+    pub bench_lanes: u32,
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    pub bench_io_chunk_bytes: usize,
+    #[arg(long, default_value_t = true)]
+    pub bench_no_disk: bool,
+    #[arg(long, default_value = "/tmp/metra-tui-bench.bin")]
+    pub bench_file_path: PathBuf,
+    #[arg(long)]
+    pub auto_runtime_report: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy: Option<PathBuf>,
+}
+
+impl Default for TuiArgs {
+    fn default() -> Self {
+        Self {
+            bench_size_gib: 1,
+            bench_lanes: 2,
+            bench_io_chunk_bytes: 8 * 1024 * 1024,
+            bench_no_disk: true,
+            bench_file_path: PathBuf::from("/tmp/metra-tui-bench.bin"),
+            auto_runtime_report: None,
+            runtime_policy: None,
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub struct SendArgs {
     #[arg(long)]
@@ -121,6 +153,10 @@ pub struct SendArgs {
     pub progress_interval_secs: u64,
     #[arg(long, default_value_t = 1)]
     pub lanes: u32,
+    #[arg(long)]
+    pub auto_runtime_report: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub runtime_profile: Option<RuntimeProfile>,
     #[arg(long)]

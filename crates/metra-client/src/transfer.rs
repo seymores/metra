@@ -473,6 +473,14 @@ pub async fn run_benchmark(
     run_benchmark_with_progress(http, server, args, 1).await
 }
 
+pub async fn run_benchmark_quiet(
+    http: &Client,
+    server: &str,
+    args: BenchArgs,
+) -> Result<SendTransferReport> {
+    run_benchmark_with_progress(http, server, args, 0).await
+}
+
 pub async fn run_benchmark_matrix(
     http: &Client,
     server: &str,
@@ -1702,6 +1710,21 @@ pub async fn send_transfer(
     server: &str,
     args: SendArgs,
 ) -> Result<SendTransferReport> {
+    let transfer = fetch_transfer_status(http, server, args.transfer_id).await?;
+    let runtime_workload_profile = RuntimeWorkloadProfile {
+        size_gib: size_gib_from_bytes_ceil(transfer.file_size_bytes),
+        lanes: args.lanes,
+        io_chunk_bytes: args.io_chunk_bytes,
+        no_disk: false,
+    };
+    let (selected_runtime_profile, runtime_profile_selection) = resolve_benchmark_runtime_profile(
+        args.runtime_profile,
+        args.auto_runtime_report.as_deref(),
+        args.runtime_policy.as_deref(),
+        &runtime_workload_profile,
+    )
+    .await?;
+
     send_transfer_with_source(
         http,
         server,
@@ -1712,9 +1735,9 @@ pub async fn send_transfer(
         args.progress_interval_secs,
         args.lanes,
         None,
-        args.runtime_profile,
+        selected_runtime_profile,
         args.file_read_pipeline_depth,
-        None,
+        runtime_profile_selection,
     )
     .await
 }
@@ -2084,6 +2107,15 @@ async fn send_generated_lane(
 fn normalized_lane_count(lanes: u32, file_size_bytes: u64) -> u32 {
     let upper = u32::try_from(file_size_bytes).unwrap_or(u32::MAX).max(1);
     lanes.max(1).min(upper)
+}
+
+fn size_gib_from_bytes_ceil(file_size_bytes: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if file_size_bytes == 0 {
+        0
+    } else {
+        file_size_bytes.saturating_add(GIB - 1) / GIB
+    }
 }
 
 fn split_ranges(file_size_bytes: u64, lanes: u32) -> Vec<(u64, u64)> {

@@ -64,6 +64,22 @@ cargo run -p metra-client -- health --output json
 cargo run -p metra-client -- tui
 ```
 
+TUI keys:
+- `r`: refresh health
+- `b`: run benchmark with current TUI benchmark config
+- `q`: quit
+
+TUI benchmark runtime auto-selection options:
+
+```bash
+cargo run -p metra-client -- tui \
+  --bench-size-gib 1 \
+  --bench-lanes 2 \
+  --bench-io-chunk-bytes 8388608 \
+  --bench-no-disk \
+  --runtime-policy /tmp/metra-reports/runtime-policy.json
+```
+
 ### 5) Create Transfer (scriptable CLI)
 
 ```bash
@@ -83,7 +99,8 @@ cargo run --release -p metra-client -- transfer create \
 cargo run --release -p metra-client -- --output json transfer send \
   --transfer-id <UUID_FROM_CREATE> \
   --file-path /tmp/input.bin \
-  --io-chunk-bytes 16777216
+  --io-chunk-bytes 16777216 \
+  --auto-runtime-report /tmp/metra-reports/tune-runtime-1g-l2.json
 ```
 
 ### 7) Query Transfer Status
@@ -147,6 +164,13 @@ cargo run --release -p metra-client -- --output json transfer tune-runtime \
 `transfer send`, `transfer bench`, and `transfer matrix` also accept:
 - `--runtime-profile balanced|throughput|low-cpu`
 - `--file-read-pipeline-depth <N>`
+- `--auto-runtime-report <PATH_TO_TUNE_RUNTIME_REPORT_JSON>`
+- `--runtime-policy <PATH_TO_RUNTIME_POLICY_JSON>`
+
+Runtime selection precedence:
+- explicit `--runtime-profile`
+- `--auto-runtime-report`
+- `--runtime-policy`
 
 Use a tune-runtime report to auto-select runtime profile for matching benchmark workloads:
 
@@ -171,6 +195,9 @@ cargo run --release -p metra-client -- --output json transfer bench \
   --no-disk \
   --runtime-policy /tmp/metra-reports/runtime-policy.json
 ```
+
+Auto runtime-profile selection from reports/policy is available for `transfer send`,
+`transfer bench`, `transfer matrix`, and TUI benchmark runs.
 
 Run a no-disk benchmark (client generates payload, server uses null sink) to isolate transfer-path overhead from filesystem I/O:
 
@@ -317,6 +344,15 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - aggregate transfer finalize duration and throughput (`metra.quic.transfer.duration.seconds`, `metra.quic.transfer.throughput.gbps`)
 - active lane stream concurrency (`metra.quic.lane.streams.active`)
 
+## CI Benchmark Gate
+
+- Workflow: `.github/workflows/benchmark-gate.yml`
+- Baseline config: `ci/benchmark-baseline.json`
+- Gate script: `scripts/ci/benchmark_gate.py`
+
+The gate runs `transfer tune-runtime` against localhost (`--no-disk`) and fails CI if any
+runtime profile p50 throughput regresses below baseline threshold.
+
 ## Current Limitations
 
 - Multi-lane transfer is currently an early implementation and still needs hardening.
@@ -359,6 +395,7 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - [x] Add runtime-policy persistence by workload profile (`--runtime-policy-out`) and automatic fallback (`--runtime-policy`).
 - [x] Add auto runtime-profile selection from tune-runtime reports (`--auto-runtime-report`).
 - [x] Fix striped null-sink transfer completion/status accounting (`--no-disk` multi-lane).
+- [x] Add CI runtime-profile regression gate (`benchmark-gate` workflow).
 
 ### Near-term Performance Roadmap
 

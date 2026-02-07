@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "description": "Localhost no-disk tune-runtime baseline for CI regression gating.",
+  "default_max_regression_percent": 35.0,
+  "profiles": {
+    "balanced": {
+      "baseline_p50_gbps": 0.25
+    },
+    "throughput": {
+      "baseline_p50_gbps": 0.25
+    },
+    "low-cpu": {
+      "baseline_p50_gbps": 0.25
+    }
+  }
+}
