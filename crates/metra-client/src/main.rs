@@ -66,6 +66,11 @@ async fn main() -> Result<()> {
                 print_output(&report, cli.output)?;
                 Ok(())
             }
+            TransferAction::TuneLanes(args) => {
+                let report = transfer::run_tune_lanes_under_load(&http, &cli.server, args).await?;
+                print_output(&report, cli.output)?;
+                Ok(())
+            }
         },
     }
 }

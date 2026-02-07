@@ -25,7 +25,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    cli::{BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, SendArgs},
+    cli::{
+        BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, SendArgs, TuneLanesArgs,
+    },
     quic::{connect_quic, read_json_frame, write_json_frame},
     rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
 };
@@ -103,6 +105,46 @@ pub struct BenchmarkCompareSeriesReport {
     largest_delta_p50_size_gib: Option<u64>,
     rows: Vec<BenchmarkCompareSeriesRow>,
     reports: Vec<BenchmarkCompareReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TuneLanesReport {
+    server: String,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    size_gib: u64,
+    concurrency: u32,
+    iterations: u32,
+    io_chunk_bytes: usize,
+    no_disk: bool,
+    lane_candidates: Vec<u32>,
+    recommended_lanes: Option<u32>,
+    candidates: Vec<TuneLanesCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TuneLanesCandidate {
+    lanes: u32,
+    aggregate_gbps: ThroughputStats,
+    transfer_gbps: ThroughputStats,
+    successful_runs: u32,
+    failed_runs: u32,
+    runs: Vec<TuneLanesRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TuneLanesRun {
+    iteration: u32,
+    lanes: u32,
+    elapsed_ms: u128,
+    aggregate_gbps: f64,
+    transfer_gbps: ThroughputStats,
+    successful_jobs: u32,
+    failed_jobs: u32,
+    host_start: HostTelemetrySnapshot,
+    host_end: HostTelemetrySnapshot,
+    host_delta: HostTelemetryDelta,
+    errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -576,6 +618,224 @@ pub async fn run_benchmark_compare_series(
         write_json_file(&path, &series).await?;
     }
     Ok(series)
+}
+
+pub async fn run_tune_lanes_under_load(
+    http: &Client,
+    server: &str,
+    args: TuneLanesArgs,
+) -> Result<TuneLanesReport> {
+    if args.size_gib == 0 {
+        anyhow::bail!("size_gib must be > 0");
+    }
+    if args.concurrency == 0 {
+        anyhow::bail!("concurrency must be > 0");
+    }
+    if args.iterations == 0 {
+        anyhow::bail!("iterations must be > 0");
+    }
+    if args.io_chunk_bytes == 0 {
+        anyhow::bail!("io_chunk_bytes must be > 0");
+    }
+    if args.lanes.is_empty() {
+        anyhow::bail!("lanes must contain at least one value");
+    }
+
+    let mut lane_candidates = args
+        .lanes
+        .iter()
+        .copied()
+        .filter(|lanes| *lanes > 0)
+        .collect::<Vec<_>>();
+    if lane_candidates.is_empty() {
+        anyhow::bail!("lanes must contain values > 0");
+    }
+    lane_candidates.sort_unstable();
+    lane_candidates.dedup();
+
+    let destination_prefix = if args.no_disk {
+        "null://benchmark/tune-lanes".to_owned()
+    } else {
+        args.destination_prefix.trim_end_matches('/').to_owned()
+    };
+    let file_size_bytes = args.size_gib * 1024 * 1024 * 1024;
+    if !args.no_disk {
+        prepare_sparse_file(&args.file_path, file_size_bytes).await?;
+    }
+
+    let started_at = Utc::now();
+    let mut telemetry = HostTelemetryCollector::new();
+    let mut candidates = Vec::with_capacity(lane_candidates.len());
+
+    for lanes in &lane_candidates {
+        let lanes = *lanes;
+        let mut runs = Vec::with_capacity(args.iterations as usize);
+        let mut aggregate_values = Vec::with_capacity(args.iterations as usize);
+        let mut transfer_values = Vec::new();
+        let mut successful_runs = 0u32;
+        let mut failed_runs = 0u32;
+
+        for iteration in 1..=args.iterations {
+            let host_start = telemetry.sample();
+            let iteration_started = Instant::now();
+            let mut join_set = JoinSet::new();
+
+            for job in 0..args.concurrency {
+                let http = http.clone();
+                let server = server.to_owned();
+                let file_name = format!(
+                    "{}-{}g-l{}-it{}-job{}.bin",
+                    args.file_prefix, args.size_gib, lanes, iteration, job
+                );
+                let source_file_path = args.file_path.clone();
+                let destination_uri = format!("{destination_prefix}/{file_name}");
+                let tenant_id = args.tenant_id.clone();
+                let user_id = args.user_id.clone();
+                let quic_addr = args.quic_addr;
+                let io_chunk_bytes = args.io_chunk_bytes;
+                let no_disk = args.no_disk;
+
+                join_set.spawn(async move {
+                    let source_uri = if no_disk {
+                        format!("generated://zeros/{file_name}")
+                    } else {
+                        format!("file://{}", source_file_path.display())
+                    };
+                    let create = CreateTransferRequest {
+                        tenant_id,
+                        user_id,
+                        source_uri,
+                        destination_uri,
+                        file_name,
+                        file_size_bytes,
+                        resume_chunk_size_bytes: RESUME_CHUNK_SIZE_BYTES,
+                        overwrite: true,
+                        immutable_destination: false,
+                    };
+                    create.validate().map_err(|err| {
+                        anyhow::anyhow!("invalid load tuning transfer request: {err}")
+                    })?;
+                    let created = create_transfer(&http, &server, &create).await?;
+
+                    let source = if no_disk {
+                        PayloadSource::GeneratedZeros {
+                            label: format!("generated://zeros/{file_size_bytes}"),
+                        }
+                    } else {
+                        PayloadSource::File(source_file_path)
+                    };
+                    send_transfer_with_source(
+                        &http,
+                        &server,
+                        created.transfer_id,
+                        source,
+                        quic_addr,
+                        io_chunk_bytes,
+                        0,
+                        lanes,
+                    )
+                    .await
+                });
+            }
+
+            let mut successful_reports = Vec::new();
+            let mut errors = Vec::new();
+            while let Some(joined) = join_set.join_next().await {
+                match joined {
+                    Ok(Ok(report)) => successful_reports.push(report),
+                    Ok(Err(err)) => errors.push(err.to_string()),
+                    Err(err) => errors.push(format!("join error: {err}")),
+                }
+            }
+
+            let elapsed_ms = iteration_started.elapsed().as_millis();
+            let streamed_bytes = successful_reports
+                .iter()
+                .map(|report| report.bytes_streamed_this_session)
+                .sum::<u64>();
+            let aggregate_gbps = if elapsed_ms == 0 {
+                0.0
+            } else {
+                (streamed_bytes as f64 * 8.0) / ((elapsed_ms as f64 / 1000.0) * 1_000_000_000.0)
+            };
+            let per_transfer_values = successful_reports
+                .iter()
+                .map(|report| report.average_gbps)
+                .collect::<Vec<_>>();
+            transfer_values.extend(per_transfer_values.iter().copied());
+            let transfer_gbps = summarize_values(&per_transfer_values);
+
+            let successful_jobs = successful_reports.len() as u32;
+            let failed_jobs = args.concurrency.saturating_sub(successful_jobs);
+            if failed_jobs == 0 {
+                successful_runs += 1;
+                aggregate_values.push(aggregate_gbps);
+            } else {
+                failed_runs += 1;
+            }
+
+            let host_end = telemetry.sample();
+            runs.push(TuneLanesRun {
+                iteration,
+                lanes,
+                elapsed_ms,
+                aggregate_gbps,
+                transfer_gbps,
+                successful_jobs,
+                failed_jobs,
+                host_start: host_start.clone(),
+                host_end: host_end.clone(),
+                host_delta: host_delta(&host_start, &host_end),
+                errors,
+            });
+        }
+
+        candidates.push(TuneLanesCandidate {
+            lanes,
+            aggregate_gbps: summarize_values(&aggregate_values),
+            transfer_gbps: summarize_values(&transfer_values),
+            successful_runs,
+            failed_runs,
+            runs,
+        });
+    }
+
+    if args.cleanup_file && !args.no_disk {
+        match fs::remove_file(&args.file_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "failed to clean tune-lanes source file {}: {}",
+                    args.file_path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    let report = TuneLanesReport {
+        server: server.to_owned(),
+        started_at,
+        completed_at: Utc::now(),
+        size_gib: args.size_gib,
+        concurrency: args.concurrency,
+        iterations: args.iterations,
+        io_chunk_bytes: args.io_chunk_bytes,
+        no_disk: args.no_disk,
+        lane_candidates: lane_candidates.clone(),
+        recommended_lanes: candidates
+            .iter()
+            .filter(|candidate| candidate.successful_runs > 0)
+            .max_by(|left, right| left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
+            .map(|candidate| candidate.lanes),
+        candidates,
+    };
+
+    if let Some(path) = args.json_out.as_ref() {
+        write_json_file(path, &report).await?;
+    }
+    Ok(report)
 }
 
 async fn run_benchmark_with_progress(

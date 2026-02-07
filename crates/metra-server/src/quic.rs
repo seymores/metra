@@ -235,10 +235,19 @@ async fn handle_quic_stream(
     let striped =
         total_lanes > 1 || range_start != 0 || range_end_exclusive != open.file_size_bytes;
 
-    let (staging_path, final_path, checkpoint_path, resume_offset, discard_payload) = {
-        let mut transfers = state.transfers.write().await;
+    let (
+        transfer_id,
+        transfer_file_size,
+        transfer_resume_chunk_size,
+        tenant_id,
+        user_id,
+        transfer_file_name,
+        destination_uri,
+        transfer_bytes_transferred,
+    ) = {
+        let transfers = state.transfers.read().await;
         let transfer = transfers
-            .get_mut(&open.transfer_id)
+            .get(&open.transfer_id)
             .with_context(|| format!("unknown transfer_id {}", open.transfer_id))?;
 
         if open.file_size_bytes != transfer.file_size_bytes {
@@ -256,62 +265,74 @@ async fn handle_quic_stream(
             );
         }
 
-        let tenant_dir = state
-            .data_dir
-            .join(&transfer.tenant_id)
-            .join(&transfer.user_id);
-        fs::create_dir_all(&tenant_dir).await.with_context(|| {
-            format!("failed creating tenant directory {}", tenant_dir.display())
-        })?;
-
-        let staging_path = tenant_dir.join(format!("{}.part", transfer.transfer_id));
-        let final_path = tenant_dir.join(&transfer.file_name);
-        let checkpoint_path = checkpoint_path_for(&tenant_dir, transfer.transfer_id);
-        let discard_payload = is_null_sink_uri(&transfer.destination_uri);
-
-        let resume_offset = if striped {
-            let (lane_resume, total_transferred) = load_or_init_lane_resume(
-                &state,
-                &checkpoint_path,
-                transfer.transfer_id,
-                transfer.file_size_bytes,
-                total_lanes,
-                open.lane_index,
-                range_start,
-                range_end_exclusive,
-            )
-            .await?;
-            transfer.bytes_transferred = total_transferred.min(transfer.file_size_bytes);
-            lane_resume
-        } else if discard_payload {
-            transfer.bytes_transferred.min(transfer.file_size_bytes)
-        } else {
-            let resume = match fs::metadata(&staging_path).await {
-                Ok(meta) => meta.len(),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(err) => return Err(err).context("failed reading staging file metadata"),
-            };
-            if resume > transfer.file_size_bytes {
-                bail!(
-                    "staging file larger than expected size: {} > {}",
-                    resume,
-                    transfer.file_size_bytes
-                );
-            }
-            transfer.bytes_transferred = resume;
-            resume
-        };
-
-        transfer.status = TransferStatus::Running;
-        transfer.updated_at = Utc::now();
         (
-            staging_path,
-            final_path,
-            checkpoint_path,
-            resume_offset,
-            discard_payload,
+            transfer.transfer_id,
+            transfer.file_size_bytes,
+            transfer.resume_chunk_size_bytes,
+            transfer.tenant_id.clone(),
+            transfer.user_id.clone(),
+            transfer.file_name.clone(),
+            transfer.destination_uri.clone(),
+            transfer.bytes_transferred,
         )
     };
+
+    let tenant_dir = state.data_dir.join(&tenant_id).join(&user_id);
+    fs::create_dir_all(&tenant_dir)
+        .await
+        .with_context(|| format!("failed creating tenant directory {}", tenant_dir.display()))?;
+
+    let staging_path = tenant_dir.join(format!("{}.part", transfer_id));
+    let final_path = tenant_dir.join(&transfer_file_name);
+    let checkpoint_path = checkpoint_path_for(&tenant_dir, transfer_id);
+    let discard_payload = is_null_sink_uri(&destination_uri);
+
+    let (resume_offset, bytes_transferred_now) = if striped {
+        let (lane_resume, total_transferred) = load_or_init_lane_resume(
+            &state,
+            &checkpoint_path,
+            transfer_id,
+            transfer_file_size,
+            total_lanes,
+            open.lane_index,
+            range_start,
+            range_end_exclusive,
+        )
+        .await?;
+        (lane_resume, total_transferred.min(transfer_file_size))
+    } else if discard_payload {
+        let bytes = transfer_bytes_transferred.min(transfer_file_size);
+        (bytes, bytes)
+    } else {
+        let resume = match fs::metadata(&staging_path).await {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err).context("failed reading staging file metadata"),
+        };
+        if resume > transfer_file_size {
+            bail!(
+                "staging file larger than expected size: {} > {}",
+                resume,
+                transfer_file_size
+            );
+        }
+        (resume, resume)
+    };
+
+    {
+        let mut transfers = state.transfers.write().await;
+        let transfer = transfers
+            .get_mut(&open.transfer_id)
+            .with_context(|| format!("unknown transfer_id {}", open.transfer_id))?;
+        if transfer.file_size_bytes != transfer_file_size
+            || transfer.resume_chunk_size_bytes != transfer_resume_chunk_size
+        {
+            bail!("transfer metadata changed while opening stream");
+        }
+        transfer.bytes_transferred = bytes_transferred_now;
+        transfer.status = TransferStatus::Running;
+        transfer.updated_at = Utc::now();
+    }
 
     if striped && !discard_payload {
         let staging_file = OpenOptions::new()

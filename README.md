@@ -149,6 +149,20 @@ cargo run --release -p metra-client -- --output json transfer compare-series \
   --cleanup-files
 ```
 
+Run lane tuning under concurrent load (sweeps lane counts, reports p50/p95, recommends lane count):
+
+```bash
+cargo run --release -p metra-client -- --output json transfer tune-lanes \
+  --size-gib 1 \
+  --lanes 1,2,4 \
+  --concurrency 2 \
+  --iterations 2 \
+  --io-chunk-bytes 16777216 \
+  --no-disk \
+  --json-out /tmp/metra-reports/tune-lanes-1g-c2-i2.json \
+  --cleanup-file
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -178,6 +192,10 @@ cargo run --release -p metra-client -- --output json transfer compare-series \
 - Compare-series telemetry sample (1 GiB, 2 lanes, 1 iteration): host snapshots include
   start/after-disk/after-no-disk CPU, memory, load-average, process CPU, and process memory
   with total deltas embedded in report JSON.
+- Tune-lanes run (1 GiB, concurrency=2, no-disk, lanes=1/2, 1 iteration):
+  - recommended lanes: `2`
+  - lane 1 aggregate: `~1.90 Gbps`
+  - lane 2 aggregate: `~2.20 Gbps`
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -213,11 +231,12 @@ These measurements are local environment baselines and do not represent target W
 
 - [x] Refactor server/client monolith files into smaller modules.
 - [x] Add multi-lane transfer support (`--lanes`) for parallel QUIC streams.
-- [ ] Validate and tune lane scheduling for higher throughput under load.
+- [x] Validate and tune lane scheduling for higher throughput under load (`transfer tune-lanes`).
 - [x] Add automated benchmark matrix for lane/chunk combinations (`transfer matrix`).
 - [x] Add repeated compare benchmark with p50/p95 reporting (`transfer compare --iterations`).
 - [x] Add multi-size compare benchmark series (`transfer compare-series`).
 - [x] Add host/runtime telemetry to compare reports (start/phase/end snapshots and deltas).
+- [ ] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
 
 ### Near-term Performance Roadmap
 

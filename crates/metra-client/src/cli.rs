@@ -40,6 +40,7 @@ pub enum TransferAction {
     Matrix(MatrixArgs),
     Compare(CompareArgs),
     CompareSeries(CompareSeriesArgs),
+    TuneLanes(TuneLanesArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -186,6 +187,38 @@ pub struct CompareSeriesArgs {
     pub iterations: u32,
     #[arg(long, default_value_t = true)]
     pub cleanup_files: bool,
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TuneLanesArgs {
+    #[arg(long, default_value_t = 2)]
+    pub size_gib: u64,
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+    pub lanes: Vec<u32>,
+    #[arg(long, default_value_t = 2)]
+    pub concurrency: u32,
+    #[arg(long, default_value_t = 2)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    pub io_chunk_bytes: usize,
+    #[arg(long, default_value_t = true)]
+    pub no_disk: bool,
+    #[arg(long, default_value = "/tmp/metra-tune-lanes.bin")]
+    pub file_path: PathBuf,
+    #[arg(long, default_value = "metra-tune-lanes")]
+    pub file_prefix: String,
+    #[arg(long, default_value = "bench-tenant")]
+    pub tenant_id: String,
+    #[arg(long, default_value = "bench-user")]
+    pub user_id: String,
+    #[arg(long, default_value = "local://benchmark/tune-lanes")]
+    pub destination_prefix: String,
+    #[arg(long)]
+    pub quic_addr: Option<SocketAddr>,
+    #[arg(long, default_value_t = true)]
+    pub cleanup_file: bool,
     #[arg(long)]
     pub json_out: Option<PathBuf>,
 }
