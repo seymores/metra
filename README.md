@@ -97,6 +97,17 @@ cargo run --release -p metra-client -- --output json transfer bench \
   --lanes 4
 ```
 
+Run a benchmark matrix (multiple size/lane/chunk permutations) and get one JSON summary:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer matrix \
+  --sizes-gib 2 \
+  --lanes 2,4,8 \
+  --io-chunk-bytes 16777216,67108864 \
+  --file-dir /tmp \
+  --cleanup-files
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -110,7 +121,10 @@ cargo run --release -p metra-client -- --output json transfer bench \
 - Release client + release server (2 GiB, 16 MiB chunks): ~0.86 Gbps.
 - Release client + release server (4 GiB, 4 lanes): ~1.23 Gbps.
 - Release client + release server (16 GiB, 4 lanes): ~1.21 Gbps.
+- Matrix (2 GiB; lanes=2/4/8; chunks=16 MiB/64 MiB): best ~1.21 Gbps at `lanes=2`, `chunk=16 MiB`.
+- Release client + release server (16 GiB, 2 lanes, 16 MiB chunks): ~1.20 Gbps.
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
+- Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
 These measurements are local environment baselines and do not represent target WAN/DC performance.
 
@@ -118,7 +132,7 @@ These measurements are local environment baselines and do not represent target W
 
 - Multi-lane transfer is currently an early implementation and still needs hardening.
 - Disk-backed local storage path only for data plane write target.
-- Resume semantics are complete for single-lane mode; striped resume is not complete.
+- Striped resume checkpointing is implemented, but still needs adversarial/fault-injection test coverage.
 - No FEC, no multi-path QUIC, no congestion-controller tuning profiles yet.
 - Browser helper and extension are still pending implementation.
 
@@ -129,7 +143,7 @@ These measurements are local environment baselines and do not represent target W
 - [x] Refactor server/client monolith files into smaller modules.
 - [x] Add multi-lane transfer support (`--lanes`) for parallel QUIC streams.
 - [ ] Validate and tune lane scheduling for higher throughput under load.
-- [ ] Add automated benchmark matrix for lane/chunk combinations.
+- [x] Add automated benchmark matrix for lane/chunk combinations (`transfer matrix`).
 
 ### Near-term Performance Roadmap
 

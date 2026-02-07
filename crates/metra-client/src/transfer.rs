@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use metra_proto::{
     CreateTransferRequest, QUIC_PROTOCOL_VERSION, QuicTransferCompleteAck, QuicTransferOpen,
     QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES,
@@ -23,7 +24,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    cli::{BenchArgs, CreateArgs, SendArgs},
+    cli::{BenchArgs, CreateArgs, MatrixArgs, SendArgs},
     quic::{connect_quic, read_json_frame, write_json_frame},
     rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
 };
@@ -40,6 +41,33 @@ pub struct SendTransferReport {
     average_gbps: f64,
     final_status: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkMatrixRun {
+    size_gib: u64,
+    lanes: u32,
+    io_chunk_bytes: usize,
+    file_path: String,
+    success: bool,
+    transfer_id: Option<Uuid>,
+    elapsed_ms: Option<u128>,
+    average_gbps: Option<f64>,
+    total_streamed_bytes: Option<u64>,
+    final_status: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkMatrixReport {
+    server: String,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    total_runs: usize,
+    successful_runs: usize,
+    failed_runs: usize,
+    best_run: Option<BenchmarkMatrixRun>,
+    runs: Vec<BenchmarkMatrixRun>,
 }
 
 #[derive(Clone)]
@@ -89,6 +117,137 @@ pub async fn run_benchmark(
     server: &str,
     args: BenchArgs,
 ) -> Result<SendTransferReport> {
+    run_benchmark_with_progress(http, server, args, 1).await
+}
+
+pub async fn run_benchmark_matrix(
+    http: &Client,
+    server: &str,
+    args: MatrixArgs,
+) -> Result<BenchmarkMatrixReport> {
+    if args.sizes_gib.is_empty() {
+        anyhow::bail!("sizes_gib must contain at least one value");
+    }
+    if args.lanes.is_empty() {
+        anyhow::bail!("lanes must contain at least one value");
+    }
+    if args.io_chunk_bytes.is_empty() {
+        anyhow::bail!("io_chunk_bytes must contain at least one value");
+    }
+    if args.sizes_gib.iter().any(|size| *size == 0) {
+        anyhow::bail!("sizes_gib values must be > 0");
+    }
+    if args.lanes.iter().any(|lanes| *lanes == 0) {
+        anyhow::bail!("lanes values must be > 0");
+    }
+    if args.io_chunk_bytes.iter().any(|chunk| *chunk == 0) {
+        anyhow::bail!("io_chunk_bytes values must be > 0");
+    }
+
+    fs::create_dir_all(&args.file_dir).await.with_context(|| {
+        format!(
+            "failed creating benchmark directory {}",
+            args.file_dir.display()
+        )
+    })?;
+
+    let started_at = Utc::now();
+    let mut runs = Vec::new();
+    let destination_prefix = args.destination_prefix.trim_end_matches('/').to_owned();
+
+    for size_gib in &args.sizes_gib {
+        for lanes in &args.lanes {
+            for io_chunk_bytes in &args.io_chunk_bytes {
+                let file_name = format!("metra-bench-{size_gib}g-l{lanes}-c{io_chunk_bytes}.bin");
+                let file_path = args.file_dir.join(&file_name);
+                let bench_args = BenchArgs {
+                    size_gib: *size_gib,
+                    file_path: file_path.clone(),
+                    tenant_id: args.tenant_id.clone(),
+                    user_id: args.user_id.clone(),
+                    destination_uri: format!("{destination_prefix}/{file_name}"),
+                    quic_addr: args.quic_addr,
+                    io_chunk_bytes: *io_chunk_bytes,
+                    lanes: *lanes,
+                };
+
+                let result = run_benchmark_with_progress(http, server, bench_args, 0).await;
+                match result {
+                    Ok(report) => runs.push(BenchmarkMatrixRun {
+                        size_gib: *size_gib,
+                        lanes: *lanes,
+                        io_chunk_bytes: *io_chunk_bytes,
+                        file_path: file_path.display().to_string(),
+                        success: true,
+                        transfer_id: Some(report.transfer_id),
+                        elapsed_ms: Some(report.elapsed_ms),
+                        average_gbps: Some(report.average_gbps),
+                        total_streamed_bytes: Some(report.total_streamed_bytes),
+                        final_status: Some(report.final_status),
+                        error: None,
+                    }),
+                    Err(err) => runs.push(BenchmarkMatrixRun {
+                        size_gib: *size_gib,
+                        lanes: *lanes,
+                        io_chunk_bytes: *io_chunk_bytes,
+                        file_path: file_path.display().to_string(),
+                        success: false,
+                        transfer_id: None,
+                        elapsed_ms: None,
+                        average_gbps: None,
+                        total_streamed_bytes: None,
+                        final_status: None,
+                        error: Some(err.to_string()),
+                    }),
+                }
+
+                if args.cleanup_files {
+                    match fs::remove_file(&file_path).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            eprintln!(
+                                "failed to clean benchmark file {}: {}",
+                                file_path.display(),
+                                err
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let successful_runs = runs.iter().filter(|run| run.success).count();
+    let failed_runs = runs.len().saturating_sub(successful_runs);
+    let best_run = runs
+        .iter()
+        .filter(|run| run.success)
+        .max_by(|left, right| {
+            left.average_gbps
+                .unwrap_or(0.0)
+                .total_cmp(&right.average_gbps.unwrap_or(0.0))
+        })
+        .cloned();
+
+    Ok(BenchmarkMatrixReport {
+        server: server.to_owned(),
+        started_at,
+        completed_at: Utc::now(),
+        total_runs: runs.len(),
+        successful_runs,
+        failed_runs,
+        best_run,
+        runs,
+    })
+}
+
+async fn run_benchmark_with_progress(
+    http: &Client,
+    server: &str,
+    args: BenchArgs,
+    progress_interval_secs: u64,
+) -> Result<SendTransferReport> {
     let file_size_bytes = args.size_gib * 1024 * 1024 * 1024;
     prepare_sparse_file(&args.file_path, file_size_bytes).await?;
 
@@ -121,7 +280,7 @@ pub async fn run_benchmark(
         file_path: args.file_path,
         quic_addr: args.quic_addr,
         io_chunk_bytes: args.io_chunk_bytes,
-        progress_interval_secs: 1,
+        progress_interval_secs,
         lanes: args.lanes,
     };
     send_transfer(http, server, send_args).await

@@ -37,6 +37,7 @@ pub enum TransferAction {
     Status(StatusArgs),
     Send(SendArgs),
     Bench(BenchArgs),
+    Matrix(MatrixArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -101,4 +102,30 @@ pub struct BenchArgs {
     pub io_chunk_bytes: usize,
     #[arg(long, default_value_t = 1)]
     pub lanes: u32,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct MatrixArgs {
+    #[arg(long, value_delimiter = ',', default_value = "4,16")]
+    pub sizes_gib: Vec<u64>,
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4")]
+    pub lanes: Vec<u32>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "4194304,16777216,67108864"
+    )]
+    pub io_chunk_bytes: Vec<usize>,
+    #[arg(long, default_value = "/tmp")]
+    pub file_dir: PathBuf,
+    #[arg(long, default_value = "bench-tenant")]
+    pub tenant_id: String,
+    #[arg(long, default_value = "bench-user")]
+    pub user_id: String,
+    #[arg(long, default_value = "local://benchmark")]
+    pub destination_prefix: String,
+    #[arg(long)]
+    pub quic_addr: Option<SocketAddr>,
+    #[arg(long, default_value_t = true)]
+    pub cleanup_files: bool,
 }

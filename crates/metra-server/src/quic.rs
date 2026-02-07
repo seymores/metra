@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -7,6 +12,7 @@ use metra_proto::{
     TransferStatus,
 };
 use quinn::crypto::rustls::QuicServerConfig;
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncSeekExt, AsyncWriteExt as TokioAsyncWriteExt, SeekFrom},
@@ -22,6 +28,83 @@ use crate::{
 
 const PROGRESS_UPDATE_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHUNK_READ_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LaneCheckpoint {
+    lane_index: u32,
+    range_start: u64,
+    range_end_exclusive: u64,
+    offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransferCheckpoint {
+    transfer_id: Uuid,
+    file_size_bytes: u64,
+    total_lanes: u32,
+    lanes: Vec<LaneCheckpoint>,
+}
+
+impl TransferCheckpoint {
+    fn total_transferred(&self) -> u64 {
+        self.lanes
+            .iter()
+            .map(|lane| lane.offset.saturating_sub(lane.range_start))
+            .sum()
+    }
+
+    fn all_lanes_complete(&self) -> bool {
+        self.lanes
+            .iter()
+            .all(|lane| lane.offset >= lane.range_end_exclusive)
+    }
+
+    fn lane_mut(&mut self, lane_index: u32) -> Option<&mut LaneCheckpoint> {
+        self.lanes
+            .iter_mut()
+            .find(|lane| lane.lane_index == lane_index)
+    }
+
+    fn validate_layout(
+        &self,
+        file_size_bytes: u64,
+        total_lanes: u32,
+        range_start: u64,
+        range_end_exclusive: u64,
+        lane_index: u32,
+    ) -> Result<()> {
+        if self.file_size_bytes != file_size_bytes {
+            bail!(
+                "checkpoint file size mismatch: {} != {}",
+                self.file_size_bytes,
+                file_size_bytes
+            );
+        }
+        if self.total_lanes != total_lanes {
+            bail!(
+                "checkpoint lane count mismatch: {} != {}",
+                self.total_lanes,
+                total_lanes
+            );
+        }
+        let lane = self
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_index == lane_index)
+            .with_context(|| format!("checkpoint missing lane {lane_index}"))?;
+        if lane.range_start != range_start || lane.range_end_exclusive != range_end_exclusive {
+            bail!(
+                "checkpoint lane range mismatch: lane {} expected {}..{} found {}..{}",
+                lane_index,
+                range_start,
+                range_end_exclusive,
+                lane.range_start,
+                lane.range_end_exclusive
+            );
+        }
+        Ok(())
+    }
+}
 
 pub async fn run_quic_listener(
     endpoint: quinn::Endpoint,
@@ -148,7 +231,7 @@ async fn handle_quic_stream(
     let striped =
         total_lanes > 1 || range_start != 0 || range_end_exclusive != open.file_size_bytes;
 
-    let (staging_path, final_path, resume_offset) = {
+    let (staging_path, final_path, checkpoint_path, resume_offset) = {
         let mut transfers = state.transfers.write().await;
         let transfer = transfers
             .get_mut(&open.transfer_id)
@@ -179,12 +262,22 @@ async fn handle_quic_stream(
 
         let staging_path = tenant_dir.join(format!("{}.part", transfer.transfer_id));
         let final_path = tenant_dir.join(&transfer.file_name);
+        let checkpoint_path = checkpoint_path_for(&tenant_dir, transfer.transfer_id);
 
         let resume_offset = if striped {
-            if transfer.status == TransferStatus::Queued {
-                transfer.bytes_transferred = 0;
-            }
-            range_start
+            let (lane_resume, total_transferred) = load_or_init_lane_resume(
+                &state,
+                &checkpoint_path,
+                transfer.transfer_id,
+                transfer.file_size_bytes,
+                total_lanes,
+                open.lane_index,
+                range_start,
+                range_end_exclusive,
+            )
+            .await?;
+            transfer.bytes_transferred = total_transferred.min(transfer.file_size_bytes);
+            lane_resume
         } else {
             let resume = match fs::metadata(&staging_path).await {
                 Ok(meta) => meta.len(),
@@ -204,7 +297,7 @@ async fn handle_quic_stream(
 
         transfer.status = TransferStatus::Running;
         transfer.updated_at = Utc::now();
-        (staging_path, final_path, resume_offset)
+        (staging_path, final_path, checkpoint_path, resume_offset)
     };
 
     if striped {
@@ -254,19 +347,38 @@ async fn handle_quic_stream(
     let mut stream_bytes_written: u64 = 0;
     let mut since_update: u64 = 0;
 
-    while stream_bytes_written < expected_bytes {
-        let Some(chunk) = recv_stream.read_chunk(MAX_CHUNK_READ_BYTES, true).await? else {
+    loop {
+        if stream_bytes_written >= expected_bytes {
+            break;
+        }
+
+        let next = match recv_stream.read_chunk(MAX_CHUNK_READ_BYTES, true).await {
+            Ok(next) => next,
+            Err(err) => {
+                if since_update > 0 {
+                    persist_progress(
+                        &state,
+                        open.transfer_id,
+                        striped,
+                        &checkpoint_path,
+                        open.lane_index,
+                        resume_offset + stream_bytes_written,
+                    )
+                    .await?;
+                }
+                return Err(err).context("failed reading stream chunk");
+            }
+        };
+
+        let Some(chunk) = next else {
             break;
         };
+
         let remaining = expected_bytes - stream_bytes_written;
         let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
         file.write_all(&chunk.bytes[..to_write])
             .await
             .context("failed writing transfer chunk to disk")?;
-        let chunk_size = to_write as u64;
-        stream_bytes_written += chunk_size;
-        since_update += chunk_size;
-
         if to_write < chunk.bytes.len() {
             bail!(
                 "received lane payload overflow for transfer {} lane {}",
@@ -275,18 +387,34 @@ async fn handle_quic_stream(
             );
         }
 
+        let chunk_size = to_write as u64;
+        stream_bytes_written += chunk_size;
+        since_update += chunk_size;
+
         if since_update >= PROGRESS_UPDATE_INTERVAL_BYTES {
-            apply_progress_update(
+            persist_progress(
                 &state,
                 open.transfer_id,
                 striped,
-                resume_offset,
-                stream_bytes_written,
-                since_update,
+                &checkpoint_path,
+                open.lane_index,
+                resume_offset + stream_bytes_written,
             )
-            .await;
+            .await?;
             since_update = 0;
         }
+    }
+
+    if since_update > 0 {
+        persist_progress(
+            &state,
+            open.transfer_id,
+            striped,
+            &checkpoint_path,
+            open.lane_index,
+            resume_offset + stream_bytes_written,
+        )
+        .await?;
     }
 
     if stream_bytes_written != expected_bytes {
@@ -299,24 +427,19 @@ async fn handle_quic_stream(
         );
     }
 
-    if since_update > 0 {
-        apply_progress_update(
-            &state,
-            open.transfer_id,
-            striped,
-            resume_offset,
-            stream_bytes_written,
-            since_update,
-        )
-        .await;
-    }
-
     file.flush()
         .await
         .context("failed flushing transfer file")?;
 
     let complete = if striped {
-        finalize_if_ready(&state, open.transfer_id, &staging_path, &final_path).await?
+        finalize_if_ready(
+            &state,
+            open.transfer_id,
+            &staging_path,
+            &final_path,
+            &checkpoint_path,
+        )
+        .await?
     } else {
         let bytes_received = resume_offset + stream_bytes_written;
         finalize_single_lane_transfer(
@@ -350,25 +473,25 @@ async fn handle_quic_stream(
     Ok(())
 }
 
-async fn apply_progress_update(
+async fn persist_progress(
     state: &AppState,
     transfer_id: Uuid,
     striped: bool,
-    resume_offset: u64,
-    stream_bytes_written: u64,
-    incremental_bytes: u64,
-) {
+    checkpoint_path: &Path,
+    lane_index: u32,
+    new_offset: u64,
+) -> Result<()> {
+    let bytes = if striped {
+        update_checkpoint_offset(state, checkpoint_path, lane_index, new_offset).await?
+    } else {
+        new_offset
+    };
     let mut transfers = state.transfers.write().await;
     if let Some(transfer) = transfers.get_mut(&transfer_id) {
-        if striped {
-            transfer.bytes_transferred =
-                (transfer.bytes_transferred + incremental_bytes).min(transfer.file_size_bytes);
-        } else {
-            transfer.bytes_transferred =
-                (resume_offset + stream_bytes_written).min(transfer.file_size_bytes);
-        }
+        transfer.bytes_transferred = bytes.min(transfer.file_size_bytes);
         transfer.updated_at = Utc::now();
     }
+    Ok(())
 }
 
 struct FinalizeResult {
@@ -412,37 +535,48 @@ async fn finalize_if_ready(
     transfer_id: Uuid,
     staging_path: &Path,
     final_path: &Path,
+    checkpoint_path: &Path,
 ) -> Result<FinalizeResult> {
-    let _guard = state.finalize_lock.lock().await;
-    let (status, bytes_transferred, file_size_bytes) = {
+    let _finalize_guard = state.finalize_lock.lock().await;
+
+    let (already_done, bytes_transferred) = {
         let transfers = state.transfers.read().await;
         let transfer = transfers
             .get(&transfer_id)
             .with_context(|| format!("unknown transfer_id {transfer_id}"))?;
         (
-            transfer.status,
+            transfer.status == TransferStatus::Completed,
             transfer.bytes_transferred,
-            transfer.file_size_bytes,
         )
     };
-
-    if status == TransferStatus::Completed {
+    if already_done {
         return Ok(FinalizeResult {
-            status,
+            status: TransferStatus::Completed,
             bytes_transferred,
             message: "transfer already finalized".to_owned(),
         });
     }
 
-    if bytes_transferred < file_size_bytes {
+    let checkpoint = load_checkpoint(state, checkpoint_path).await?;
+    let total = checkpoint.total_transferred();
+    if !checkpoint.all_lanes_complete() {
+        set_transfer_status(state, transfer_id, TransferStatus::Running, total).await;
         return Ok(FinalizeResult {
             status: TransferStatus::Running,
-            bytes_transferred,
+            bytes_transferred: total,
             message: "lane complete; waiting for remaining lanes".to_owned(),
         });
     }
 
-    finalize_transfer_on_disk(state, transfer_id, staging_path, final_path).await
+    let finalized = finalize_transfer_on_disk(state, transfer_id, staging_path, final_path).await?;
+    if let Err(err) = fs::remove_file(checkpoint_path).await {
+        warn!(
+            error = %err,
+            checkpoint = %checkpoint_path.display(),
+            "failed removing checkpoint file after finalize"
+        );
+    }
+    Ok(finalized)
 }
 
 async fn finalize_transfer_on_disk(
@@ -542,4 +676,133 @@ async fn set_transfer_status(
         transfer.bytes_transferred = bytes_transferred.min(transfer.file_size_bytes);
         transfer.updated_at = Utc::now();
     }
+}
+
+async fn load_or_init_lane_resume(
+    state: &AppState,
+    checkpoint_path: &Path,
+    transfer_id: Uuid,
+    file_size_bytes: u64,
+    total_lanes: u32,
+    lane_index: u32,
+    range_start: u64,
+    range_end_exclusive: u64,
+) -> Result<(u64, u64)> {
+    let _guard = state.checkpoint_lock.lock().await;
+    let mut checkpoint = if fs::try_exists(checkpoint_path).await? {
+        load_checkpoint_unlocked(checkpoint_path).await?
+    } else {
+        let fresh = new_checkpoint(transfer_id, file_size_bytes, total_lanes);
+        persist_checkpoint_unlocked(checkpoint_path, &fresh).await?;
+        fresh
+    };
+
+    checkpoint.validate_layout(
+        file_size_bytes,
+        total_lanes,
+        range_start,
+        range_end_exclusive,
+        lane_index,
+    )?;
+    let lane = checkpoint
+        .lane_mut(lane_index)
+        .with_context(|| format!("missing lane {lane_index} in checkpoint"))?;
+    lane.offset = lane
+        .offset
+        .clamp(lane.range_start, lane.range_end_exclusive);
+    let resume = lane.offset;
+    let total = checkpoint.total_transferred();
+    persist_checkpoint_unlocked(checkpoint_path, &checkpoint).await?;
+    Ok((resume, total))
+}
+
+async fn update_checkpoint_offset(
+    state: &AppState,
+    checkpoint_path: &Path,
+    lane_index: u32,
+    new_offset: u64,
+) -> Result<u64> {
+    let _guard = state.checkpoint_lock.lock().await;
+    let mut checkpoint = load_checkpoint_unlocked(checkpoint_path).await?;
+    let lane = checkpoint
+        .lane_mut(lane_index)
+        .with_context(|| format!("missing lane {lane_index} in checkpoint"))?;
+    lane.offset = new_offset.clamp(lane.range_start, lane.range_end_exclusive);
+    let total = checkpoint.total_transferred();
+    persist_checkpoint_unlocked(checkpoint_path, &checkpoint).await?;
+    Ok(total)
+}
+
+async fn load_checkpoint(state: &AppState, checkpoint_path: &Path) -> Result<TransferCheckpoint> {
+    let _guard = state.checkpoint_lock.lock().await;
+    load_checkpoint_unlocked(checkpoint_path).await
+}
+
+async fn load_checkpoint_unlocked(checkpoint_path: &Path) -> Result<TransferCheckpoint> {
+    let bytes = fs::read(checkpoint_path).await.with_context(|| {
+        format!(
+            "failed reading checkpoint file {}",
+            checkpoint_path.display()
+        )
+    })?;
+    serde_json::from_slice::<TransferCheckpoint>(&bytes).with_context(|| {
+        format!(
+            "failed parsing checkpoint file {}",
+            checkpoint_path.display()
+        )
+    })
+}
+
+async fn persist_checkpoint_unlocked(
+    checkpoint_path: &Path,
+    checkpoint: &TransferCheckpoint,
+) -> Result<()> {
+    let json =
+        serde_json::to_vec_pretty(checkpoint).context("failed serializing checkpoint JSON")?;
+    fs::write(checkpoint_path, json).await.with_context(|| {
+        format!(
+            "failed writing checkpoint file {}",
+            checkpoint_path.display()
+        )
+    })
+}
+
+fn checkpoint_path_for(tenant_dir: &Path, transfer_id: Uuid) -> PathBuf {
+    tenant_dir.join(format!("{transfer_id}.part.meta.json"))
+}
+
+fn new_checkpoint(transfer_id: Uuid, file_size_bytes: u64, total_lanes: u32) -> TransferCheckpoint {
+    let lanes = split_ranges(file_size_bytes, total_lanes)
+        .into_iter()
+        .enumerate()
+        .map(
+            |(lane_index, (range_start, range_end_exclusive))| LaneCheckpoint {
+                lane_index: lane_index as u32,
+                range_start,
+                range_end_exclusive,
+                offset: range_start,
+            },
+        )
+        .collect();
+    TransferCheckpoint {
+        transfer_id,
+        file_size_bytes,
+        total_lanes,
+        lanes,
+    }
+}
+
+fn split_ranges(file_size_bytes: u64, lanes: u32) -> Vec<(u64, u64)> {
+    let base = file_size_bytes / lanes as u64;
+    let remainder = file_size_bytes % lanes as u64;
+
+    let mut ranges = Vec::with_capacity(lanes as usize);
+    let mut start = 0u64;
+    for lane in 0..lanes {
+        let lane_len = base + u64::from((lane as u64) < remainder);
+        let end = start + lane_len;
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
 }

@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
                 print_output(&report, cli.output)?;
                 Ok(())
             }
+            TransferAction::Matrix(args) => {
+                let report = transfer::run_benchmark_matrix(&http, &cli.server, args).await?;
+                print_output(&report, cli.output)?;
+                Ok(())
+            }
         },
     }
 }

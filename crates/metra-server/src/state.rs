@@ -12,6 +12,7 @@ pub struct AppState {
     pub quic_server_name: Arc<String>,
     pub quic_cert_der_b64: Arc<String>,
     pub finalize_lock: Arc<Mutex<()>>,
+    pub checkpoint_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -28,6 +29,7 @@ impl AppState {
             quic_server_name: Arc::new(quic_server_name),
             quic_cert_der_b64: Arc::new(quic_cert_der_b64),
             finalize_lock: Arc::new(Mutex::new(())),
+            checkpoint_lock: Arc::new(Mutex::new(())),
         }
     }
 }
