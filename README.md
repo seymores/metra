@@ -160,6 +160,7 @@ cargo run --release -p metra-client -- --output json transfer tune-lanes \
   --io-chunk-bytes 16777216 \
   --no-disk \
   --json-out /tmp/metra-reports/tune-lanes-1g-c2-i2.json \
+  --lane-policy-out /tmp/metra-reports/lane-policy.json \
   --cleanup-file
 ```
 
@@ -174,6 +175,20 @@ cargo run --release -p metra-client -- --output json transfer bench \
   --no-disk \
   --auto-lanes-report /tmp/metra-reports/tune-lanes-1g-c2-i2.json
 ```
+
+Use persisted lane policy (from one or more tune runs) to auto-select lanes with workload fallback:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer bench \
+  --size-gib 2 \
+  --file-path /tmp/metra-auto-policy-2g.bin \
+  --io-chunk-bytes 16777216 \
+  --lanes 1 \
+  --no-disk \
+  --lane-policy /tmp/metra-reports/lane-policy.json
+```
+
+`--auto-lanes-report` takes precedence over `--lane-policy` when both are provided.
 
 ## Resume Validation
 
@@ -211,6 +226,12 @@ cargo run --release -p metra-client -- --output json transfer bench \
 - Auto-lane bench sample (1 GiB no-disk, configured `--lanes 1` + tune report):
   - effective lanes: `2` (auto-selected from report)
   - achieved throughput: `~1.72 Gbps`
+- Lane-policy bench sample (2 GiB no-disk, configured `--lanes 4` + persisted policy):
+  - effective lanes: `1` (exact profile match from policy)
+  - achieved throughput: `~1.91 Gbps`
+- Lane-policy fallback sample (3 GiB no-disk, configured `--lanes 4` + persisted policy):
+  - effective lanes: `1` (fallback to nearest profile `size=2 GiB`, `concurrency=1`)
+  - achieved throughput: `~1.84 Gbps`
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -252,7 +273,7 @@ These measurements are local environment baselines and do not represent target W
 - [x] Add multi-size compare benchmark series (`transfer compare-series`).
 - [x] Add host/runtime telemetry to compare reports (start/phase/end snapshots and deltas).
 - [x] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
-- [ ] Add lane-policy persistence by workload profile (size/concurrency) and automatic fallback.
+- [x] Add lane-policy persistence by workload profile (size/concurrency) and automatic fallback.
 
 ### Near-term Performance Roadmap
 

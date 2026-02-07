@@ -28,6 +28,10 @@ use crate::{
     cli::{
         BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, SendArgs, TuneLanesArgs,
     },
+    lane_policy::{
+        LanePolicyEntry, WorkloadProfile, read_lane_policy, select_lane_policy,
+        upsert_lane_policy_entry,
+    },
     quic::{connect_quic, read_json_frame, write_json_frame},
     rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
 };
@@ -52,6 +56,8 @@ pub struct SendTransferReport {
 pub struct BenchmarkMatrixRun {
     size_gib: u64,
     lanes: u32,
+    effective_lanes: Option<u32>,
+    lane_selection: Option<String>,
     io_chunk_bytes: usize,
     file_path: String,
     success: bool,
@@ -325,6 +331,7 @@ pub async fn run_benchmark_matrix(
                     lanes: *lanes,
                     no_disk: args.no_disk,
                     auto_lanes_report: args.auto_lanes_report.clone(),
+                    lane_policy: args.lane_policy.clone(),
                 };
 
                 let result = run_benchmark_with_progress(http, server, bench_args, 0).await;
@@ -332,6 +339,8 @@ pub async fn run_benchmark_matrix(
                     Ok(report) => runs.push(BenchmarkMatrixRun {
                         size_gib: *size_gib,
                         lanes: *lanes,
+                        effective_lanes: Some(report.effective_lanes),
+                        lane_selection: report.lane_selection.clone(),
                         io_chunk_bytes: *io_chunk_bytes,
                         file_path: report.file_path.clone(),
                         success: true,
@@ -345,6 +354,8 @@ pub async fn run_benchmark_matrix(
                     Err(err) => runs.push(BenchmarkMatrixRun {
                         size_gib: *size_gib,
                         lanes: *lanes,
+                        effective_lanes: None,
+                        lane_selection: None,
                         io_chunk_bytes: *io_chunk_bytes,
                         file_path: file_path.display().to_string(),
                         success: false,
@@ -434,6 +445,7 @@ pub async fn run_benchmark_compare(
             lanes: args.lanes,
             no_disk: false,
             auto_lanes_report: None,
+            lane_policy: None,
         };
         let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
         let host_after_disk = telemetry.sample();
@@ -449,6 +461,7 @@ pub async fn run_benchmark_compare(
             lanes: args.lanes,
             no_disk: true,
             auto_lanes_report: None,
+            lane_policy: None,
         };
         let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
         let host_after_no_disk = telemetry.sample();
@@ -820,6 +833,7 @@ pub async fn run_tune_lanes_under_load(
         }
     }
 
+    let recommended_lanes = recommended_lanes_from_candidates(&candidates);
     let report = TuneLanesReport {
         server: server.to_owned(),
         started_at,
@@ -830,69 +844,140 @@ pub async fn run_tune_lanes_under_load(
         io_chunk_bytes: args.io_chunk_bytes,
         no_disk: args.no_disk,
         lane_candidates: lane_candidates.clone(),
-        recommended_lanes: candidates
-            .iter()
-            .filter(|candidate| candidate.successful_runs > 0)
-            .max_by(|left, right| left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
-            .map(|candidate| candidate.lanes),
+        recommended_lanes,
         candidates,
     };
 
     if let Some(path) = args.json_out.as_ref() {
         write_json_file(path, &report).await?;
     }
+    if let Some(path) = args.lane_policy_out.as_ref() {
+        persist_tune_lanes_policy(path, args.json_out.as_deref(), &report).await?;
+    }
     Ok(report)
+}
+
+fn recommended_lanes_from_candidates(candidates: &[TuneLanesCandidate]) -> Option<u32> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.successful_runs > 0)
+        .max_by(|left, right| left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
+        .map(|candidate| candidate.lanes)
+}
+
+fn recommended_lanes_from_report(report: &TuneLanesReport) -> Option<u32> {
+    report
+        .recommended_lanes
+        .or_else(|| recommended_lanes_from_candidates(&report.candidates))
+}
+
+async fn persist_tune_lanes_policy(
+    policy_path: &Path,
+    json_out: Option<&Path>,
+    report: &TuneLanesReport,
+) -> Result<()> {
+    let recommended_lanes = recommended_lanes_from_report(report)
+        .filter(|lanes| *lanes > 0)
+        .context("cannot persist lane policy: tune-lanes report has no recommended lanes")?;
+    let selected = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.lanes == recommended_lanes);
+
+    let entry = LanePolicyEntry {
+        profile: WorkloadProfile {
+            size_gib: report.size_gib,
+            concurrency: report.concurrency,
+            io_chunk_bytes: report.io_chunk_bytes,
+            no_disk: report.no_disk,
+        },
+        recommended_lanes,
+        source: json_out
+            .map(|path| format!("tune-lanes report {}", path.display()))
+            .unwrap_or_else(|| "transfer tune-lanes".to_owned()),
+        tuned_at: report.completed_at,
+        aggregate_p50_gbps: selected
+            .map(|candidate| candidate.aggregate_gbps.p50)
+            .unwrap_or(0.0),
+        aggregate_p95_gbps: selected
+            .map(|candidate| candidate.aggregate_gbps.p95)
+            .unwrap_or(0.0),
+    };
+    upsert_lane_policy_entry(policy_path, entry).await
 }
 
 async fn resolve_benchmark_lanes(
     configured_lanes: u32,
     auto_lanes_report: Option<&Path>,
-    size_gib: u64,
+    lane_policy_path: Option<&Path>,
+    requested_profile: &WorkloadProfile,
 ) -> Result<(u32, Option<String>)> {
     if configured_lanes == 0 {
         anyhow::bail!("lanes must be > 0");
     }
 
-    let Some(report_path) = auto_lanes_report else {
-        return Ok((configured_lanes, None));
-    };
-
-    let payload = fs::read(report_path)
-        .await
-        .with_context(|| format!("failed reading auto lanes report {}", report_path.display()))?;
-    let report = serde_json::from_slice::<TuneLanesReport>(&payload).with_context(|| {
-        format!(
-            "failed parsing auto lanes report JSON {}",
-            report_path.display()
-        )
-    })?;
-
-    let selected = report.recommended_lanes.or_else(|| {
-        report
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.successful_runs > 0)
-            .max_by(|left, right| left.aggregate_gbps.p50.total_cmp(&right.aggregate_gbps.p50))
-            .map(|candidate| candidate.lanes)
-    });
-
-    if let Some(lanes) = selected.filter(|lanes| *lanes > 0) {
-        let selection = if report.size_gib == size_gib {
+    if let Some(report_path) = auto_lanes_report {
+        let payload = fs::read(report_path).await.with_context(|| {
+            format!("failed reading auto lanes report {}", report_path.display())
+        })?;
+        let report = serde_json::from_slice::<TuneLanesReport>(&payload).with_context(|| {
             format!(
-                "auto-selected lanes={} from {}",
-                lanes,
+                "failed parsing auto lanes report JSON {}",
                 report_path.display()
             )
-        } else {
-            format!(
-                "auto-selected lanes={} from {} (report size_gib={} requested size_gib={})",
-                lanes,
-                report_path.display(),
-                report.size_gib,
-                size_gib
-            )
-        };
-        return Ok((lanes, Some(selection)));
+        })?;
+
+        if let Some(lanes) = recommended_lanes_from_report(&report).filter(|lanes| *lanes > 0) {
+            let exact = report.size_gib == requested_profile.size_gib
+                && report.concurrency == requested_profile.concurrency
+                && report.io_chunk_bytes == requested_profile.io_chunk_bytes
+                && report.no_disk == requested_profile.no_disk;
+            let selection = if exact {
+                format!(
+                    "auto-selected lanes={} from {}",
+                    lanes,
+                    report_path.display()
+                )
+            } else {
+                format!(
+                    "auto-selected lanes={} from {} (report profile size_gib={} concurrency={} io_chunk_bytes={} no_disk={})",
+                    lanes,
+                    report_path.display(),
+                    report.size_gib,
+                    report.concurrency,
+                    report.io_chunk_bytes,
+                    report.no_disk
+                )
+            };
+            return Ok((lanes, Some(selection)));
+        }
+    }
+
+    if let Some(policy_path) = lane_policy_path {
+        let policy = read_lane_policy(policy_path).await?;
+        if let Some(selection) = select_lane_policy(&policy, requested_profile) {
+            let lanes = selection.entry.recommended_lanes;
+            if lanes > 0 {
+                let selection_note = if selection.exact_profile_match {
+                    format!(
+                        "auto-selected lanes={} from lane policy {}",
+                        lanes,
+                        policy_path.display()
+                    )
+                } else {
+                    format!(
+                        "auto-selected lanes={} from lane policy {} fallback profile size_gib={} concurrency={} io_chunk_bytes={} no_disk={}",
+                        lanes,
+                        policy_path.display(),
+                        selection.entry.profile.size_gib,
+                        selection.entry.profile.concurrency,
+                        selection.entry.profile.io_chunk_bytes,
+                        selection.entry.profile.no_disk
+                    )
+                };
+                return Ok((lanes, Some(selection_note)));
+            }
+        }
     }
 
     Ok((configured_lanes, None))
@@ -904,9 +989,19 @@ async fn run_benchmark_with_progress(
     args: BenchArgs,
     progress_interval_secs: u64,
 ) -> Result<SendTransferReport> {
-    let (selected_lanes, lane_selection) =
-        resolve_benchmark_lanes(args.lanes, args.auto_lanes_report.as_deref(), args.size_gib)
-            .await?;
+    let workload_profile = WorkloadProfile {
+        size_gib: args.size_gib,
+        concurrency: 1,
+        io_chunk_bytes: args.io_chunk_bytes,
+        no_disk: args.no_disk,
+    };
+    let (selected_lanes, lane_selection) = resolve_benchmark_lanes(
+        args.lanes,
+        args.auto_lanes_report.as_deref(),
+        args.lane_policy.as_deref(),
+        &workload_profile,
+    )
+    .await?;
 
     let file_size_bytes = args.size_gib * 1024 * 1024 * 1024;
     let file_name = args
@@ -1066,28 +1161,38 @@ async fn send_transfer_with_source(
         join_set.spawn(async move { send_lane(connection, lane, progress).await });
     }
 
-    let mut bytes_streamed_this_session = 0u64;
-    let mut resumed_from_bytes = 0u64;
-    let mut best_ack: Option<QuicTransferCompleteAck> = None;
+    let lane_results = async {
+        let mut bytes_streamed_this_session = 0u64;
+        let mut resumed_from_bytes = 0u64;
+        let mut best_ack: Option<QuicTransferCompleteAck> = None;
 
-    while let Some(joined) = join_set.join_next().await {
-        let lane_result = joined.context("lane task panicked")??;
-        bytes_streamed_this_session += lane_result.bytes_streamed;
-        resumed_from_bytes += lane_result.resumed_from_bytes;
-        if best_ack
-            .as_ref()
-            .is_none_or(|ack| lane_result.complete_ack.bytes_received > ack.bytes_received)
-        {
-            best_ack = Some(lane_result.complete_ack);
+        while let Some(joined) = join_set.join_next().await {
+            let lane_result = joined.context("lane task panicked")??;
+            bytes_streamed_this_session += lane_result.bytes_streamed;
+            resumed_from_bytes += lane_result.resumed_from_bytes;
+            if best_ack
+                .as_ref()
+                .is_none_or(|ack| lane_result.complete_ack.bytes_received > ack.bytes_received)
+            {
+                best_ack = Some(lane_result.complete_ack);
+            }
         }
+
+        let complete_ack = best_ack.context("no completion ack received from server")?;
+        Ok::<_, anyhow::Error>((
+            bytes_streamed_this_session,
+            resumed_from_bytes,
+            complete_ack,
+        ))
     }
+    .await;
 
     stop_progress.store(true, Ordering::Relaxed);
     if let Some(task) = progress_task {
         let _ = task.await;
     }
 
-    let complete_ack = best_ack.context("no completion ack received from server")?;
+    let (bytes_streamed_this_session, resumed_from_bytes, complete_ack) = lane_results?;
     let elapsed_ms = started_at.elapsed().as_millis();
     let avg_gbps = if elapsed_ms == 0 {
         0.0

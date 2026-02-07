@@ -109,6 +109,8 @@ pub struct BenchArgs {
     pub no_disk: bool,
     #[arg(long)]
     pub auto_lanes_report: Option<PathBuf>,
+    #[arg(long)]
+    pub lane_policy: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -139,6 +141,8 @@ pub struct MatrixArgs {
     pub no_disk: bool,
     #[arg(long)]
     pub auto_lanes_report: Option<PathBuf>,
+    #[arg(long)]
+    pub lane_policy: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -225,4 +229,6 @@ pub struct TuneLanesArgs {
     pub cleanup_file: bool,
     #[arg(long)]
     pub json_out: Option<PathBuf>,
+    #[arg(long)]
+    pub lane_policy_out: Option<PathBuf>,
 }
