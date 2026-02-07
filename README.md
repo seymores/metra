@@ -132,6 +132,9 @@ cargo run --release -p metra-client -- --output json transfer compare \
   --cleanup-file
 ```
 
+`transfer compare` and `transfer compare-series` reports now include host telemetry snapshots
+(CPU, memory, load average, process memory/CPU) for each iteration.
+
 Run a compare-series benchmark across multiple sizes:
 
 ```bash
@@ -172,6 +175,9 @@ cargo run --release -p metra-client -- --output json transfer compare-series \
 - Compare-series run (1/2 GiB, 2 lanes, 16 MiB, 2 iterations each):
   - 1 GiB p50: disk `~1.209 Gbps`, no-disk `~1.828 Gbps`, delta `~+51.18%`
   - 2 GiB p50: disk `~1.201 Gbps`, no-disk `~1.833 Gbps`, delta `~+52.60%`
+- Compare-series telemetry sample (1 GiB, 2 lanes, 1 iteration): host snapshots include
+  start/after-disk/after-no-disk CPU, memory, load-average, process CPU, and process memory
+  with total deltas embedded in report JSON.
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -187,6 +193,22 @@ These measurements are local environment baselines and do not represent target W
 
 ## TODO and Plan
 
+### Execution Plan (Prioritized)
+
+1. Transport/runtime telemetry foundation (in progress)
+   - Add per-run host/runtime metrics to benchmark artifacts.
+   - Extend toward per-lane QUIC metrics and OpenTelemetry spans.
+2. Hot-path performance refactor
+   - Build bounded read/schedule/send and receive/write pipelines with reusable buffers.
+3. QUIC tuning profiles and sweeps
+   - Add `lan`, `wan`, `high-bdp` transport presets and automated parameter sweeps.
+4. Striped resume hardening
+   - Add atomic checkpoint persistence and adversarial restart/corruption tests.
+5. WAN realism harness
+   - Add `tc/netem` profiles and capture p50/p95 throughput + completion-rate reports.
+6. Integrity and compliance foundations
+   - Add chunk/final digest verification and structured audit log export for SIEM/S3.
+
 ### Immediate (Current Iteration)
 
 - [x] Refactor server/client monolith files into smaller modules.
@@ -195,6 +217,7 @@ These measurements are local environment baselines and do not represent target W
 - [x] Add automated benchmark matrix for lane/chunk combinations (`transfer matrix`).
 - [x] Add repeated compare benchmark with p50/p95 reporting (`transfer compare --iterations`).
 - [x] Add multi-size compare benchmark series (`transfer compare-series`).
+- [x] Add host/runtime telemetry to compare reports (start/phase/end snapshots and deltas).
 
 ### Near-term Performance Roadmap
 

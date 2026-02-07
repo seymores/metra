@@ -15,6 +15,7 @@ use metra_proto::{
 };
 use reqwest::Client;
 use serde::Serialize;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt as TokioAsyncReadExt, AsyncSeekExt, SeekFrom},
@@ -122,6 +123,10 @@ pub struct BenchmarkCompareIteration {
     delta_gbps: f64,
     delta_percent_over_disk: f64,
     disk_fraction_of_no_disk: f64,
+    host_start: HostTelemetrySnapshot,
+    host_after_disk: HostTelemetrySnapshot,
+    host_after_no_disk: HostTelemetrySnapshot,
+    host_total_delta: HostTelemetryDelta,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +136,29 @@ pub struct ThroughputStats {
     p95: f64,
     max: f64,
     mean: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostTelemetrySnapshot {
+    captured_at: DateTime<Utc>,
+    global_cpu_percent: f64,
+    used_memory_bytes: u64,
+    total_memory_bytes: u64,
+    process_cpu_percent: Option<f64>,
+    process_memory_bytes: Option<u64>,
+    process_virtual_memory_bytes: Option<u64>,
+    load_avg_one: f64,
+    load_avg_five: f64,
+    load_avg_fifteen: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostTelemetryDelta {
+    global_cpu_percent_delta: f64,
+    used_memory_bytes_delta: i64,
+    process_cpu_percent_delta: Option<f64>,
+    process_memory_bytes_delta: Option<i64>,
+    process_virtual_memory_bytes_delta: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -345,8 +373,11 @@ pub async fn run_benchmark_compare(
 
     let json_out = args.json_out.clone();
     let started_at = Utc::now();
+    let mut telemetry = HostTelemetryCollector::new();
     let mut runs = Vec::with_capacity(args.iterations as usize);
     for iteration in 1..=args.iterations {
+        let host_start = telemetry.sample();
+
         let disk_args = BenchArgs {
             size_gib: args.size_gib,
             file_path: args.file_path.clone(),
@@ -359,6 +390,7 @@ pub async fn run_benchmark_compare(
             no_disk: false,
         };
         let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
+        let host_after_disk = telemetry.sample();
 
         let no_disk_args = BenchArgs {
             size_gib: args.size_gib,
@@ -372,6 +404,7 @@ pub async fn run_benchmark_compare(
             no_disk: true,
         };
         let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
+        let host_after_no_disk = telemetry.sample();
 
         let delta_gbps = no_disk.average_gbps - disk_backed.average_gbps;
         let delta_percent_over_disk = if disk_backed.average_gbps > 0.0 {
@@ -392,6 +425,10 @@ pub async fn run_benchmark_compare(
             delta_gbps,
             delta_percent_over_disk,
             disk_fraction_of_no_disk,
+            host_start: host_start.clone(),
+            host_after_disk: host_after_disk.clone(),
+            host_after_no_disk: host_after_no_disk.clone(),
+            host_total_delta: host_delta(&host_start, &host_after_no_disk),
         });
     }
 
@@ -893,6 +930,68 @@ async fn report_progress(
             break;
         }
     }
+}
+
+struct HostTelemetryCollector {
+    system: System,
+    pid: Option<Pid>,
+}
+
+impl HostTelemetryCollector {
+    fn new() -> Self {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let pid = sysinfo::get_current_pid().ok();
+        Self { system, pid }
+    }
+
+    fn sample(&mut self) -> HostTelemetrySnapshot {
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        if let Some(pid) = self.pid {
+            self.system
+                .refresh_processes(ProcessesToUpdate::Some(&[pid]));
+        }
+
+        let process = self.pid.and_then(|pid| self.system.process(pid));
+        let load = System::load_average();
+        HostTelemetrySnapshot {
+            captured_at: Utc::now(),
+            global_cpu_percent: self.system.global_cpu_usage() as f64,
+            used_memory_bytes: self.system.used_memory(),
+            total_memory_bytes: self.system.total_memory(),
+            process_cpu_percent: process.map(|proc| proc.cpu_usage() as f64),
+            process_memory_bytes: process.map(|proc| proc.memory()),
+            process_virtual_memory_bytes: process.map(|proc| proc.virtual_memory()),
+            load_avg_one: load.one,
+            load_avg_five: load.five,
+            load_avg_fifteen: load.fifteen,
+        }
+    }
+}
+
+fn host_delta(start: &HostTelemetrySnapshot, end: &HostTelemetrySnapshot) -> HostTelemetryDelta {
+    HostTelemetryDelta {
+        global_cpu_percent_delta: end.global_cpu_percent - start.global_cpu_percent,
+        used_memory_bytes_delta: signed_delta_u64(end.used_memory_bytes, start.used_memory_bytes),
+        process_cpu_percent_delta: end
+            .process_cpu_percent
+            .zip(start.process_cpu_percent)
+            .map(|(end, start)| end - start),
+        process_memory_bytes_delta: end
+            .process_memory_bytes
+            .zip(start.process_memory_bytes)
+            .map(|(end, start)| signed_delta_u64(end, start)),
+        process_virtual_memory_bytes_delta: end
+            .process_virtual_memory_bytes
+            .zip(start.process_virtual_memory_bytes)
+            .map(|(end, start)| signed_delta_u64(end, start)),
+    }
+}
+
+fn signed_delta_u64(end: u64, start: u64) -> i64 {
+    let delta = end as i128 - start as i128;
+    delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 fn summarize_values(values: &[f64]) -> ThroughputStats {
