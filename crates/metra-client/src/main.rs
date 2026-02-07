@@ -55,6 +55,11 @@ async fn main() -> Result<()> {
                 print_output(&report, cli.output)?;
                 Ok(())
             }
+            TransferAction::Compare(args) => {
+                let report = transfer::run_benchmark_compare(&http, &cli.server, args).await?;
+                print_output(&report, cli.output)?;
+                Ok(())
+            }
         },
     }
 }

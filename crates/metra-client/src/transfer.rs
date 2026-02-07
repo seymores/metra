@@ -24,7 +24,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    cli::{BenchArgs, CreateArgs, MatrixArgs, SendArgs},
+    cli::{BenchArgs, CompareArgs, CreateArgs, MatrixArgs, SendArgs},
     quic::{connect_quic, read_json_frame, write_json_frame},
     rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
 };
@@ -68,6 +68,21 @@ pub struct BenchmarkMatrixReport {
     failed_runs: usize,
     best_run: Option<BenchmarkMatrixRun>,
     runs: Vec<BenchmarkMatrixRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkCompareReport {
+    server: String,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    size_gib: u64,
+    lanes: u32,
+    io_chunk_bytes: usize,
+    disk_backed: SendTransferReport,
+    no_disk: SendTransferReport,
+    delta_gbps: f64,
+    delta_percent_over_disk: f64,
+    disk_fraction_of_no_disk: f64,
 }
 
 #[derive(Clone)]
@@ -259,6 +274,90 @@ pub async fn run_benchmark_matrix(
         failed_runs,
         best_run,
         runs,
+    })
+}
+
+pub async fn run_benchmark_compare(
+    http: &Client,
+    server: &str,
+    args: CompareArgs,
+) -> Result<BenchmarkCompareReport> {
+    if args.size_gib == 0 {
+        anyhow::bail!("size_gib must be > 0");
+    }
+    if args.lanes == 0 {
+        anyhow::bail!("lanes must be > 0");
+    }
+    if args.io_chunk_bytes == 0 {
+        anyhow::bail!("io_chunk_bytes must be > 0");
+    }
+
+    let started_at = Utc::now();
+
+    let disk_args = BenchArgs {
+        size_gib: args.size_gib,
+        file_path: args.file_path.clone(),
+        tenant_id: args.tenant_id.clone(),
+        user_id: args.user_id.clone(),
+        destination_uri: args.destination_uri.clone(),
+        quic_addr: args.quic_addr,
+        io_chunk_bytes: args.io_chunk_bytes,
+        lanes: args.lanes,
+        no_disk: false,
+    };
+    let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
+
+    let no_disk_args = BenchArgs {
+        size_gib: args.size_gib,
+        file_path: args.file_path.clone(),
+        tenant_id: args.tenant_id,
+        user_id: args.user_id,
+        destination_uri: args.destination_uri,
+        quic_addr: args.quic_addr,
+        io_chunk_bytes: args.io_chunk_bytes,
+        lanes: args.lanes,
+        no_disk: true,
+    };
+    let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
+
+    if args.cleanup_file {
+        match fs::remove_file(&args.file_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "failed to clean compare benchmark file {}: {}",
+                    args.file_path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    let delta_gbps = no_disk.average_gbps - disk_backed.average_gbps;
+    let delta_percent_over_disk = if disk_backed.average_gbps > 0.0 {
+        (delta_gbps / disk_backed.average_gbps) * 100.0
+    } else {
+        0.0
+    };
+    let disk_fraction_of_no_disk = if no_disk.average_gbps > 0.0 {
+        disk_backed.average_gbps / no_disk.average_gbps
+    } else {
+        0.0
+    };
+
+    Ok(BenchmarkCompareReport {
+        server: server.to_owned(),
+        started_at,
+        completed_at: Utc::now(),
+        size_gib: args.size_gib,
+        lanes: args.lanes,
+        io_chunk_bytes: args.io_chunk_bytes,
+        disk_backed,
+        no_disk,
+        delta_gbps,
+        delta_percent_over_disk,
+        disk_fraction_of_no_disk,
     })
 }
 

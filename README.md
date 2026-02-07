@@ -119,6 +119,17 @@ cargo run --release -p metra-client -- --output json transfer bench \
   --no-disk
 ```
 
+Run a side-by-side compare benchmark (disk-backed + no-disk in one command):
+
+```bash
+cargo run --release -p metra-client -- --output json transfer compare \
+  --size-gib 2 \
+  --file-path /tmp/metra-bench-compare-2g.bin \
+  --io-chunk-bytes 16777216 \
+  --lanes 2 \
+  --cleanup-file
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -137,6 +148,7 @@ cargo run --release -p metra-client -- --output json transfer bench \
 - Release client + release server (16 GiB, 2 lanes, 16 MiB chunks): ~1.20 Gbps.
 - Release client + release server (4 GiB, disk-backed, 2 lanes, 16 MiB chunks): ~1.18 Gbps.
 - Release client + release server (4 GiB, `--no-disk`, 2 lanes, 16 MiB chunks): ~1.81 Gbps.
+- Compare run (2 GiB, 2 lanes, 16 MiB): disk `~1.21 Gbps`, no-disk `~1.88 Gbps`, delta `+56.24%`.
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
