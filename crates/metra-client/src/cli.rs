@@ -157,4 +157,6 @@ pub struct CompareArgs {
     pub iterations: u32,
     #[arg(long, default_value_t = true)]
     pub cleanup_file: bool,
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
 }

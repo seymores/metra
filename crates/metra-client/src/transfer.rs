@@ -316,6 +316,7 @@ pub async fn run_benchmark_compare(
         anyhow::bail!("iterations must be > 0");
     }
 
+    let json_out = args.json_out.clone();
     let started_at = Utc::now();
     let mut runs = Vec::with_capacity(args.iterations as usize);
     for iteration in 1..=args.iterations {
@@ -399,7 +400,7 @@ pub async fn run_benchmark_compare(
         .map(|run| run.disk_fraction_of_no_disk)
         .collect::<Vec<_>>();
 
-    Ok(BenchmarkCompareReport {
+    let report = BenchmarkCompareReport {
         server: server.to_owned(),
         started_at,
         completed_at: Utc::now(),
@@ -413,7 +414,11 @@ pub async fn run_benchmark_compare(
         delta_percent_over_disk: summarize_values(&delta_percent_values),
         disk_fraction_of_no_disk: summarize_values(&fraction_values),
         runs,
-    })
+    };
+    if let Some(path) = json_out {
+        write_json_file(&path, &report).await?;
+    }
+    Ok(report)
 }
 
 async fn run_benchmark_with_progress(
@@ -830,5 +835,18 @@ async fn prepare_sparse_file(path: &Path, size: u64) -> Result<()> {
     file.set_len(size)
         .await
         .with_context(|| format!("failed sizing benchmark file {}", path.display()))?;
+    Ok(())
+}
+
+async fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+    let payload = serde_json::to_vec_pretty(value).context("failed serializing JSON report")?;
+    fs::write(path, payload)
+        .await
+        .with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
 }

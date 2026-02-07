@@ -128,6 +128,7 @@ cargo run --release -p metra-client -- --output json transfer compare \
   --io-chunk-bytes 16777216 \
   --lanes 2 \
   --iterations 3 \
+  --json-out /tmp/metra-reports/compare-2g.json \
   --cleanup-file
 ```
 
