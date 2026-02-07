@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override minimum accepted success rate per candidate (0..1)",
     )
+    parser.add_argument(
+        "--scenario",
+        default=None,
+        help="Optional baseline scenario key (for example: latency, loss, jitter)",
+    )
     return parser.parse_args()
 
 
@@ -50,6 +55,14 @@ def candidate_p50(candidate: dict) -> float:
     return 0.0
 
 
+def candidate_p95(candidate: dict) -> float:
+    aggregate = candidate.get("aggregate_gbps", {})
+    p95 = aggregate.get("p95")
+    if isinstance(p95, (int, float)):
+        return float(p95)
+    return 0.0
+
+
 def candidate_success_rate(candidate: dict) -> float:
     success_rate = candidate.get("success_rate")
     if isinstance(success_rate, (int, float)):
@@ -70,11 +83,65 @@ def candidate_recommendation_score(candidate: dict) -> float:
     return 0.0
 
 
+def resolve_baseline_candidates(
+    baseline: dict, scenario: str | None
+) -> tuple[dict, float, float, float]:
+    if scenario:
+        scenarios = baseline.get("scenarios", {})
+        if not isinstance(scenarios, dict) or scenario not in scenarios:
+            raise ValueError(f"baseline scenario '{scenario}' not found")
+        scenario_cfg = scenarios[scenario]
+        if not isinstance(scenario_cfg, dict):
+            raise ValueError(f"baseline scenario '{scenario}' is not an object")
+        candidates = scenario_cfg.get("candidates", {})
+        if not isinstance(candidates, dict) or not candidates:
+            raise ValueError(f"baseline scenario '{scenario}' candidates are missing")
+        default_max_regression = float(
+            scenario_cfg.get(
+                "default_max_regression_percent",
+                baseline.get("default_max_regression_percent", 40.0),
+            )
+        )
+        default_min_success = float(
+            scenario_cfg.get(
+                "default_min_success_rate",
+                baseline.get("default_min_success_rate", 0.5),
+            )
+        )
+        min_recommended_score = float(
+            scenario_cfg.get(
+                "min_recommended_score",
+                baseline.get("min_recommended_score", 0.0),
+            )
+        )
+        return (
+            candidates,
+            default_max_regression,
+            default_min_success,
+            min_recommended_score,
+        )
+
+    candidates = baseline.get("candidates", {})
+    if not isinstance(candidates, dict) or not candidates:
+        raise ValueError("lane baseline candidates are missing")
+    default_max_regression = float(baseline.get("default_max_regression_percent", 40.0))
+    default_min_success = float(baseline.get("default_min_success_rate", 0.5))
+    min_recommended_score = float(baseline.get("min_recommended_score", 0.0))
+    return candidates, default_max_regression, default_min_success, min_recommended_score
+
+
+def fmt_float(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"
+
+
 def render_summary(
     rows: list[dict],
     failures: list[str],
     report_path: Path,
     baseline_path: Path,
+    scenario: str | None,
     recommended_lanes: int | None,
     recommended_score: float | None,
 ) -> str:
@@ -83,18 +150,29 @@ def render_summary(
         "",
         f"- Report: `{report_path}`",
         f"- Baseline: `{baseline_path}`",
+        f"- Scenario: `{scenario if scenario else 'default'}`",
         f"- Recommended lanes: `{recommended_lanes}`",
         f"- Recommended score: `{recommended_score if recommended_score is not None else 'n/a'}`",
         "",
-        "| Lanes | Current p50 (Gbps) | Baseline p50 (Gbps) | Threshold (Gbps) | Success Rate | Min Success Rate | Result |",
-        "|---:|---:|---:|---:|---:|---:|---|",
+        "| Lanes | Current p50 | Baseline p50 | Threshold p50 | Current p95 | Baseline p95 | Threshold p95 | Success Rate | Min Success Rate | Result |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
-    table = [
-        "| {lanes} | {current:.3f} | {baseline:.3f} | {threshold:.3f} | {success_rate:.2f} | {min_success_rate:.2f} | {result} |".format(
-            **row
+    table = []
+    for row in rows:
+        table.append(
+            "| {lanes} | {current_p50} | {baseline_p50} | {threshold_p50} | {current_p95} | {baseline_p95} | {threshold_p95} | {success_rate:.2f} | {min_success_rate:.2f} | {result} |".format(
+                lanes=row["lanes"],
+                current_p50=fmt_float(row["current_p50"]),
+                baseline_p50=fmt_float(row["baseline_p50"]),
+                threshold_p50=fmt_float(row["threshold_p50"]),
+                current_p95=fmt_float(row["current_p95"]),
+                baseline_p95=fmt_float(row["baseline_p95"]),
+                threshold_p95=fmt_float(row["threshold_p95"]),
+                success_rate=row["success_rate"],
+                min_success_rate=row["min_success_rate"],
+                result=row["result"],
+            )
         )
-        for row in rows
-    ]
     footer = []
     if failures:
         footer.extend(["", "### Failures"])
@@ -113,22 +191,28 @@ def main() -> int:
     baseline = load_json(baseline_path)
 
     lanes = lane_map(report)
-    baseline_candidates = baseline.get("candidates", {})
-    if not isinstance(baseline_candidates, dict) or not baseline_candidates:
-        print("lane baseline candidates are missing", file=sys.stderr)
+    try:
+        (
+            baseline_candidates,
+            baseline_default_max_regression,
+            baseline_default_min_success_rate,
+            baseline_min_recommended_score,
+        ) = resolve_baseline_candidates(baseline, args.scenario)
+    except ValueError as err:
+        print(str(err), file=sys.stderr)
         return 2
 
     default_max_regression = (
         float(args.default_max_regression_percent)
         if args.default_max_regression_percent is not None
-        else float(baseline.get("default_max_regression_percent", 40.0))
+        else baseline_default_max_regression
     )
     default_min_success_rate = (
         float(args.default_min_success_rate)
         if args.default_min_success_rate is not None
-        else float(baseline.get("default_min_success_rate", 0.5))
+        else baseline_default_min_success_rate
     )
-    min_recommended_score = float(baseline.get("min_recommended_score", 0.0))
+    min_recommended_score = baseline_min_recommended_score
 
     rows: list[dict] = []
     failures: list[str] = []
@@ -146,8 +230,20 @@ def main() -> int:
         if not isinstance(baseline_p50, (int, float)) or float(baseline_p50) <= 0:
             failures.append(f"lane '{lane_key}' has invalid baseline_p50_gbps")
             continue
+        baseline_p95_value = lane_cfg.get("baseline_p95_gbps")
+        baseline_p95 = (
+            float(baseline_p95_value)
+            if isinstance(baseline_p95_value, (int, float))
+            and float(baseline_p95_value) > 0
+            else None
+        )
         allowed = float(lane_cfg.get("max_regression_percent", default_max_regression))
-        threshold = float(baseline_p50) * max(0.0, (1.0 - allowed / 100.0))
+        threshold_p50 = float(baseline_p50) * max(0.0, (1.0 - allowed / 100.0))
+        threshold_p95 = (
+            baseline_p95 * max(0.0, (1.0 - allowed / 100.0))
+            if baseline_p95 is not None
+            else None
+        )
         min_success_rate = float(
             lane_cfg.get("min_success_rate", default_min_success_rate)
         )
@@ -158,9 +254,12 @@ def main() -> int:
             rows.append(
                 {
                     "lanes": lane_count,
-                    "current": 0.0,
-                    "baseline": float(baseline_p50),
-                    "threshold": threshold,
+                    "current_p50": 0.0,
+                    "baseline_p50": float(baseline_p50),
+                    "threshold_p50": threshold_p50,
+                    "current_p95": 0.0,
+                    "baseline_p95": baseline_p95,
+                    "threshold_p95": threshold_p95,
                     "success_rate": 0.0,
                     "min_success_rate": min_success_rate,
                     "result": "FAIL",
@@ -168,14 +267,22 @@ def main() -> int:
             )
             continue
 
-        current = candidate_p50(candidate)
+        current_p50 = candidate_p50(candidate)
+        current_p95 = candidate_p95(candidate)
         success_rate = candidate_success_rate(candidate)
         result = "PASS"
-        if current < threshold:
+        if current_p50 < threshold_p50:
             failures.append(
-                f"lane {lane_count} regressed: current={current:.3f} Gbps "
-                f"< threshold={threshold:.3f} Gbps "
+                f"lane {lane_count} p50 regressed: current={current_p50:.3f} Gbps "
+                f"< threshold={threshold_p50:.3f} Gbps "
                 f"(baseline={float(baseline_p50):.3f}, allowed={allowed:.1f}%)"
+            )
+            result = "FAIL"
+        if threshold_p95 is not None and current_p95 < threshold_p95:
+            failures.append(
+                f"lane {lane_count} p95 regressed: current={current_p95:.3f} Gbps "
+                f"< threshold={threshold_p95:.3f} Gbps "
+                f"(baseline={baseline_p95:.3f}, allowed={allowed:.1f}%)"
             )
             result = "FAIL"
         if success_rate < min_success_rate:
@@ -187,9 +294,12 @@ def main() -> int:
         rows.append(
             {
                 "lanes": lane_count,
-                "current": current,
-                "baseline": float(baseline_p50),
-                "threshold": threshold,
+                "current_p50": current_p50,
+                "baseline_p50": float(baseline_p50),
+                "threshold_p50": threshold_p50,
+                "current_p95": current_p95,
+                "baseline_p95": baseline_p95,
+                "threshold_p95": threshold_p95,
                 "success_rate": success_rate,
                 "min_success_rate": min_success_rate,
                 "result": result,
@@ -222,6 +332,7 @@ def main() -> int:
         failures,
         report_path,
         baseline_path,
+        args.scenario,
         recommended_lanes,
         recommended_score,
     )

@@ -52,6 +52,16 @@ cargo run --release -p metra-server -- \
 - `wan`: lower receive/send windows with longer idle timeout.
 - `high-bdp`: larger windows for long-fat networks.
 
+Cloud profile recommendation (AWS):
+
+- Default for most production deployments: `--quic-profile wan`
+- Dedicated high-throughput, high-RTT paths (for example cross-region heavy transfer): `--quic-profile high-bdp`
+- Same-AZ or very low-latency private networking: `--quic-profile lan`
+
+If you need one default cloud profile, use `wan`, then tune with:
+- `transfer tune-runtime`
+- `transfer tune-lanes`
+
 ### 3) Check Health (CLI)
 
 ```bash
@@ -294,6 +304,46 @@ cargo run --release -p metra-client -- --output json transfer bench \
 
 `--auto-lanes-report` takes precedence over `--lane-policy` when both are provided.
 
+## WAN Realism Harness (`tc/netem`)
+
+Linux-only harness script:
+
+```bash
+sudo ./scripts/netem.sh apply latency lo
+sudo ./scripts/netem.sh show lo
+sudo ./scripts/netem.sh clear lo
+```
+
+Available profiles:
+- `latency`: delay-focused WAN emulation (`80ms +/- 10ms`)
+- `loss`: packet-loss-focused WAN emulation (`40ms +/- 5ms`, `0.5%` loss)
+- `jitter`: jitter-focused WAN emulation (`60ms +/- 30ms`, `0.1%` loss)
+
+Run runtime and lane tuning under a netem profile:
+
+```bash
+sudo ./scripts/netem.sh apply jitter lo
+
+cargo run --release -p metra-client -- --output json transfer tune-runtime \
+  --size-gib 1 \
+  --lanes 2 \
+  --iterations 1 \
+  --io-chunk-bytes 8388608 \
+  --no-disk \
+  --json-out /tmp/metra-reports/tune-runtime-jitter.json
+
+cargo run --release -p metra-client -- --output json transfer tune-lanes \
+  --size-gib 1 \
+  --lanes 1,2 \
+  --concurrency 2 \
+  --iterations 1 \
+  --io-chunk-bytes 8388608 \
+  --no-disk \
+  --json-out /tmp/metra-reports/tune-lanes-jitter.json
+
+sudo ./scripts/netem.sh clear lo
+```
+
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
@@ -364,11 +414,16 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - Gate script: `scripts/ci/benchmark_gate.py`
 - Lane baseline config: `ci/lane-baseline.json`
 - Lane gate script: `scripts/ci/lane_gate.py`
+- WAN runtime baseline config: `ci/netem-runtime-baseline.json`
+- WAN lane baseline config: `ci/netem-lane-baseline.json`
+- Netem harness script: `scripts/netem.sh`
 
 The gate runs `transfer tune-runtime` against localhost (`--no-disk`) and fails CI if any
-runtime profile p50 throughput regresses below baseline threshold.
+runtime profile p50/p95 throughput regresses below baseline threshold.
 It also runs `transfer tune-lanes` and fails CI if lane throughput/success/stability regresses
 below lane baseline thresholds.
+It also runs WAN realism matrix jobs under netem `latency`, `loss`, and `jitter` profiles and
+applies scenario-specific p50/p95 regression gates.
 
 ## Current Limitations
 
@@ -424,7 +479,7 @@ below lane baseline thresholds.
 - [x] Add per-lane and aggregate throughput metrics via OpenTelemetry.
 - [x] Add CPU/runtime tuning profile presets (chunk + pipeline depth) and sweep command.
 - [x] Add adaptive runtime auto-selection from persisted tune-runtime profiles.
-- [ ] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.
+- [x] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.
 - [x] Add automated benchmark profile sweep (`transfer matrix-profiles`) with profile detection.
 
 ### Reliability and Data Integrity

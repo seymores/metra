@@ -88,3 +88,99 @@ jobs:
           if [ -f /tmp/metra-server.pid ]; then
             kill "$(cat /tmp/metra-server.pid)" || true
           fi
+
+  wan-netem-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        netem_profile: [latency, loss, jitter]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release -p metra-server -p metra-client
+
+      - name: Start metra-server
+        run: |
+          mkdir -p /tmp/metra-data
+          target/release/metra-server \
+            --rest-addr 127.0.0.1:8080 \
+            --quic-addr 127.0.0.1:8443 \
+            --data-dir /tmp/metra-data \
+            --quic-profile wan > /tmp/metra-server.log 2>&1 &
+          echo $! > /tmp/metra-server.pid
+
+      - name: Wait for server health
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed health check" >&2
+          exit 1
+
+      - name: Apply netem profile
+        run: |
+          sudo scripts/netem.sh apply "${{ matrix.netem_profile }}" lo
+
+      - name: Run netem runtime tuning benchmark
+        run: |
+          mkdir -p /tmp/metra-reports
+          target/release/metra-client --server http://127.0.0.1:8080 --output json transfer tune-runtime \
+            --size-gib 1 \
+            --lanes 2 \
+            --iterations 1 \
+            --io-chunk-bytes 8388608 \
+            --no-disk \
+            --json-out /tmp/metra-reports/tune-runtime-${{ matrix.netem_profile }}.json
+
+      - name: Gate netem runtime p50/p95
+        run: |
+          python3 scripts/ci/benchmark_gate.py \
+            --report /tmp/metra-reports/tune-runtime-${{ matrix.netem_profile }}.json \
+            --baseline ci/netem-runtime-baseline.json \
+            --scenario "${{ matrix.netem_profile }}"
+
+      - name: Run netem lane tuning benchmark
+        run: |
+          target/release/metra-client --server http://127.0.0.1:8080 --output json transfer tune-lanes \
+            --size-gib 1 \
+            --lanes 1,2 \
+            --concurrency 2 \
+            --iterations 1 \
+            --io-chunk-bytes 8388608 \
+            --no-disk \
+            --json-out /tmp/metra-reports/tune-lanes-${{ matrix.netem_profile }}.json
+
+      - name: Gate netem lane p50/p95
+        run: |
+          python3 scripts/ci/lane_gate.py \
+            --report /tmp/metra-reports/tune-lanes-${{ matrix.netem_profile }}.json \
+            --baseline ci/netem-lane-baseline.json \
+            --scenario "${{ matrix.netem_profile }}"
+
+      - name: Dump server log on failure
+        if: failure()
+        run: |
+          echo "==== metra-server.log ===="
+          cat /tmp/metra-server.log || true
+
+      - name: Clear netem profile
+        if: always()
+        run: |
+          sudo scripts/netem.sh clear lo || true
+
+      - name: Stop metra-server
+        if: always()
+        run: |
+          if [ -f /tmp/metra-server.pid ]; then
+            kill "$(cat /tmp/metra-server.pid)" || true
+          fi

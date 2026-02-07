@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "description": "Runtime throughput baseline for WAN netem scenarios in CI (p50 + p95 gating).",
+  "default_max_regression_percent": 45.0,
+  "scenarios": {
+    "latency": {
+      "default_max_regression_percent": 45.0,
+      "profiles": {
+        "balanced": {
+          "baseline_p50_gbps": 0.10,
+          "baseline_p95_gbps": 0.10
+        },
+        "throughput": {
+          "baseline_p50_gbps": 0.10,
+          "baseline_p95_gbps": 0.10
+        },
+        "low-cpu": {
+          "baseline_p50_gbps": 0.10,
+          "baseline_p95_gbps": 0.10
+        }
+      }
+    },
+    "loss": {
+      "default_max_regression_percent": 50.0,
+      "profiles": {
+        "balanced": {
+          "baseline_p50_gbps": 0.08,
+          "baseline_p95_gbps": 0.08
+        },
+        "throughput": {
+          "baseline_p50_gbps": 0.08,
+          "baseline_p95_gbps": 0.08
+        },
+        "low-cpu": {
+          "baseline_p50_gbps": 0.08,
+          "baseline_p95_gbps": 0.08
+        }
+      }
+    },
+    "jitter": {
+      "default_max_regression_percent": 50.0,
+      "profiles": {
+        "balanced": {
+          "baseline_p50_gbps": 0.08,
+          "baseline_p95_gbps": 0.08
+        },
+        "throughput": {
+          "baseline_p50_gbps": 0.08,
+          "baseline_p95_gbps": 0.08
+        },
+        "low-cpu": {
+          "baseline_p50_gbps": 0.08,
+          "baseline_p95_gbps": 0.08
+        }
+      }
+    }
+  }
+}
