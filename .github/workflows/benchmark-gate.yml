@@ -167,6 +167,32 @@ jobs:
             --baseline ci/netem-lane-baseline.json \
             --scenario "${{ matrix.netem_profile }}"
 
+      - name: Generate netem baseline suggestion artifact
+        if: always()
+        run: |
+          if [ -f /tmp/metra-reports/tune-runtime-${{ matrix.netem_profile }}.json ] && [ -f /tmp/metra-reports/tune-lanes-${{ matrix.netem_profile }}.json ]; then
+            python3 scripts/ci/netem_baseline_suggest.py \
+              --scenario "${{ matrix.netem_profile }}" \
+              --runtime-report /tmp/metra-reports/tune-runtime-${{ matrix.netem_profile }}.json \
+              --lane-report /tmp/metra-reports/tune-lanes-${{ matrix.netem_profile }}.json \
+              --json-out /tmp/metra-reports/netem-baseline-suggest-${{ matrix.netem_profile }}.json \
+              --md-out /tmp/metra-reports/netem-baseline-suggest-${{ matrix.netem_profile }}.md
+          else
+            echo "Missing report files for scenario ${{ matrix.netem_profile }}" > /tmp/metra-reports/netem-baseline-suggest-${{ matrix.netem_profile }}.md
+          fi
+
+      - name: Upload netem reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netem-${{ matrix.netem_profile }}-reports
+          path: |
+            /tmp/metra-reports/tune-runtime-${{ matrix.netem_profile }}.json
+            /tmp/metra-reports/tune-lanes-${{ matrix.netem_profile }}.json
+            /tmp/metra-reports/netem-baseline-suggest-${{ matrix.netem_profile }}.json
+            /tmp/metra-reports/netem-baseline-suggest-${{ matrix.netem_profile }}.md
+          if-no-files-found: warn
+
       - name: Dump server log on failure
         if: failure()
         run: |

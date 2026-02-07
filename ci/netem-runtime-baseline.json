@@ -1,56 +1,69 @@
 {
   "schema_version": 1,
-  "description": "Runtime throughput baseline for WAN netem scenarios in CI (p50 + p95 gating).",
-  "default_max_regression_percent": 45.0,
+  "description": "Runtime throughput baseline for WAN netem scenarios in CI (p50 + p95 + completion-rate gating).",
+  "default_max_regression_percent": 35.0,
+  "default_min_success_rate": 0.80,
   "scenarios": {
     "latency": {
-      "default_max_regression_percent": 45.0,
+      "default_max_regression_percent": 35.0,
+      "default_min_success_rate": 0.80,
       "profiles": {
         "balanced": {
           "baseline_p50_gbps": 0.10,
-          "baseline_p95_gbps": 0.10
+          "baseline_p95_gbps": 0.10,
+          "min_success_rate": 0.80
         },
         "throughput": {
           "baseline_p50_gbps": 0.10,
-          "baseline_p95_gbps": 0.10
+          "baseline_p95_gbps": 0.10,
+          "min_success_rate": 0.80
         },
         "low-cpu": {
           "baseline_p50_gbps": 0.10,
-          "baseline_p95_gbps": 0.10
+          "baseline_p95_gbps": 0.10,
+          "min_success_rate": 0.80
         }
       }
     },
     "loss": {
-      "default_max_regression_percent": 50.0,
+      "default_max_regression_percent": 40.0,
+      "default_min_success_rate": 0.80,
       "profiles": {
         "balanced": {
           "baseline_p50_gbps": 0.08,
-          "baseline_p95_gbps": 0.08
+          "baseline_p95_gbps": 0.08,
+          "min_success_rate": 0.80
         },
         "throughput": {
           "baseline_p50_gbps": 0.08,
-          "baseline_p95_gbps": 0.08
+          "baseline_p95_gbps": 0.08,
+          "min_success_rate": 0.80
         },
         "low-cpu": {
           "baseline_p50_gbps": 0.08,
-          "baseline_p95_gbps": 0.08
+          "baseline_p95_gbps": 0.08,
+          "min_success_rate": 0.80
         }
       }
     },
     "jitter": {
-      "default_max_regression_percent": 50.0,
+      "default_max_regression_percent": 40.0,
+      "default_min_success_rate": 0.80,
       "profiles": {
         "balanced": {
           "baseline_p50_gbps": 0.08,
-          "baseline_p95_gbps": 0.08
+          "baseline_p95_gbps": 0.08,
+          "min_success_rate": 0.80
         },
         "throughput": {
           "baseline_p50_gbps": 0.08,
-          "baseline_p95_gbps": 0.08
+          "baseline_p95_gbps": 0.08,
+          "min_success_rate": 0.80
         },
         "low-cpu": {
           "baseline_p50_gbps": 0.08,
-          "baseline_p95_gbps": 0.08
+          "baseline_p95_gbps": 0.08,
+          "min_success_rate": 0.80
         }
       }
     }

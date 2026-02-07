@@ -1,16 +1,20 @@
 {
   "schema_version": 1,
-  "description": "Localhost no-disk tune-runtime baseline for CI regression gating.",
+  "description": "Localhost no-disk tune-runtime baseline for CI regression gating (p50 + completion-rate).",
   "default_max_regression_percent": 35.0,
+  "default_min_success_rate": 0.90,
   "profiles": {
     "balanced": {
-      "baseline_p50_gbps": 0.25
+      "baseline_p50_gbps": 0.25,
+      "min_success_rate": 0.90
     },
     "throughput": {
-      "baseline_p50_gbps": 0.25
+      "baseline_p50_gbps": 0.25,
+      "min_success_rate": 0.90
     },
     "low-cpu": {
-      "baseline_p50_gbps": 0.25
+      "baseline_p50_gbps": 0.25,
+      "min_success_rate": 0.90
     }
   }
 }

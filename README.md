@@ -419,11 +419,16 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - Netem harness script: `scripts/netem.sh`
 
 The gate runs `transfer tune-runtime` against localhost (`--no-disk`) and fails CI if any
-runtime profile p50/p95 throughput regresses below baseline threshold.
+runtime profile p50/p95 throughput or completion-rate regresses below baseline threshold.
 It also runs `transfer tune-lanes` and fails CI if lane throughput/success/stability regresses
 below lane baseline thresholds.
 It also runs WAN realism matrix jobs under netem `latency`, `loss`, and `jitter` profiles and
 applies scenario-specific p50/p95 regression gates.
+
+Each WAN scenario job uploads artifacts:
+- runtime report JSON
+- lane report JSON
+- auto-generated baseline suggestion JSON/Markdown (`netem-baseline-suggest-<scenario>.*`)
 
 ## Current Limitations
 
