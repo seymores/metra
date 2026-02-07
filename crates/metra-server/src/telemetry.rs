@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{global, trace::TracerProvider as _};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn install_crypto_provider() {
@@ -9,7 +9,10 @@ pub fn install_crypto_provider() {
 pub fn init_telemetry() -> Result<()> {
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
     let tracer = tracer_provider.tracer("metra-server");
-    opentelemetry::global::set_tracer_provider(tracer_provider);
+    global::set_tracer_provider(tracer_provider);
+
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
+    global::set_meter_provider(meter_provider);
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "metra_server=info,tower_http=info,axum=info,quinn=info".into());

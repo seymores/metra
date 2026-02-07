@@ -1,6 +1,7 @@
 mod api;
 mod args;
 mod quic;
+mod quic_metrics;
 mod signal;
 mod state;
 mod telemetry;

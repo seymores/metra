@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    quic_metrics,
     state::AppState,
     wire::{read_json_frame, write_json_frame},
 };
@@ -31,6 +32,67 @@ const MAX_CHUNK_READ_BYTES: usize = 8 * 1024 * 1024;
 
 fn is_null_sink_uri(uri: &str) -> bool {
     uri.starts_with("null://") || uri.starts_with("memory://") || uri.starts_with("mem://")
+}
+
+struct LaneStreamMetricGuard {
+    lane_index: u32,
+    total_lanes: u32,
+    striped: bool,
+    no_disk: bool,
+    started_at: Instant,
+    bytes_received: u64,
+    finished: bool,
+}
+
+impl LaneStreamMetricGuard {
+    fn new(lane_index: u32, total_lanes: u32, striped: bool, no_disk: bool) -> Self {
+        quic_metrics::record_lane_stream_started(lane_index, total_lanes, striped, no_disk);
+        Self {
+            lane_index,
+            total_lanes,
+            striped,
+            no_disk,
+            started_at: Instant::now(),
+            bytes_received: 0,
+            finished: false,
+        }
+    }
+
+    fn add_bytes(&mut self, bytes: u64) {
+        self.bytes_received = self.bytes_received.saturating_add(bytes);
+    }
+
+    fn finish(&mut self, status: TransferStatus) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        quic_metrics::record_lane_stream_finished(
+            self.lane_index,
+            self.total_lanes,
+            self.striped,
+            self.no_disk,
+            status,
+            self.bytes_received,
+            self.started_at.elapsed(),
+        );
+    }
+}
+
+impl Drop for LaneStreamMetricGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            quic_metrics::record_lane_stream_finished(
+                self.lane_index,
+                self.total_lanes,
+                self.striped,
+                self.no_disk,
+                TransferStatus::Failed,
+                self.bytes_received,
+                self.started_at.elapsed(),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +395,7 @@ async fn handle_quic_stream(
         transfer.status = TransferStatus::Running;
         transfer.updated_at = Utc::now();
     }
+    mark_transfer_started_if_absent(&state, open.transfer_id).await;
 
     if striped && !discard_payload {
         let staging_file = OpenOptions::new()
@@ -364,6 +427,8 @@ async fn handle_quic_stream(
         resume_offset = resume_offset,
         "accepted upload stream"
     );
+    let mut lane_metrics =
+        LaneStreamMetricGuard::new(open.lane_index, total_lanes, striped, discard_payload);
 
     let mut file = if discard_payload {
         None
@@ -431,6 +496,7 @@ async fn handle_quic_stream(
         let chunk_size = to_write as u64;
         stream_bytes_written += chunk_size;
         since_update += chunk_size;
+        lane_metrics.add_bytes(chunk_size);
 
         if since_update >= PROGRESS_UPDATE_INTERVAL_BYTES {
             persist_progress(
@@ -498,6 +564,23 @@ async fn handle_quic_stream(
         )
         .await?
     };
+    lane_metrics.finish(complete.status);
+    if matches!(
+        complete.status,
+        TransferStatus::Completed | TransferStatus::Failed
+    ) {
+        if let Some(transfer_started_at) = take_transfer_started_at(&state, open.transfer_id).await
+        {
+            quic_metrics::record_transfer_finished(
+                total_lanes,
+                striped,
+                discard_payload,
+                complete.status,
+                complete.bytes_transferred,
+                transfer_started_at.elapsed(),
+            );
+        }
+    }
 
     let complete_ack = QuicTransferCompleteAck {
         ok: complete.status == TransferStatus::Completed,
@@ -518,6 +601,16 @@ async fn handle_quic_stream(
     );
 
     Ok(())
+}
+
+async fn mark_transfer_started_if_absent(state: &AppState, transfer_id: Uuid) {
+    let mut started_at = state.transfer_started_at.write().await;
+    started_at.entry(transfer_id).or_insert_with(Instant::now);
+}
+
+async fn take_transfer_started_at(state: &AppState, transfer_id: Uuid) -> Option<Instant> {
+    let mut started_at = state.transfer_started_at.write().await;
+    started_at.remove(&transfer_id)
 }
 
 async fn persist_progress(

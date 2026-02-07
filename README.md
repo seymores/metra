@@ -237,6 +237,15 @@ cargo run --release -p metra-client -- --output json transfer bench \
 
 These measurements are local environment baselines and do not represent target WAN/DC performance.
 
+## OpenTelemetry Metrics
+
+Server-side QUIC data path now records OpenTelemetry metrics for:
+
+- per-lane stream lifecycle and bytes (`metra.quic.lane.streams.*`, `metra.quic.lane.bytes.received.total`)
+- per-lane duration and throughput (`metra.quic.lane.duration.seconds`, `metra.quic.lane.throughput.gbps`)
+- aggregate transfer finalize duration and throughput (`metra.quic.transfer.duration.seconds`, `metra.quic.transfer.throughput.gbps`)
+- active lane stream concurrency (`metra.quic.lane.streams.active`)
+
 ## Current Limitations
 
 - Multi-lane transfer is currently an early implementation and still needs hardening.
@@ -278,7 +287,7 @@ These measurements are local environment baselines and do not represent target W
 ### Near-term Performance Roadmap
 
 - [ ] Implement bounded pipeline stages for read/encrypt-send/receive-write.
-- [ ] Add per-lane and aggregate throughput metrics via OpenTelemetry.
+- [x] Add per-lane and aggregate throughput metrics via OpenTelemetry.
 - [ ] Add CPU and runtime tuning profile (thread affinity, buffer sizing).
 - [ ] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.
 

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
 use metra_proto::TransferSummary;
 use tokio::sync::{Mutex, RwLock};
@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AppState {
     pub transfers: Arc<RwLock<HashMap<Uuid, TransferSummary>>>,
+    pub transfer_started_at: Arc<RwLock<HashMap<Uuid, Instant>>>,
     pub quic_addr: SocketAddr,
     pub data_dir: Arc<PathBuf>,
     pub quic_server_name: Arc<String>,
@@ -24,6 +25,7 @@ impl AppState {
     ) -> Self {
         Self {
             transfers: Arc::new(RwLock::new(HashMap::new())),
+            transfer_started_at: Arc::new(RwLock::new(HashMap::new())),
             quic_addr,
             data_dir: Arc::new(data_dir),
             quic_server_name: Arc::new(quic_server_name),
