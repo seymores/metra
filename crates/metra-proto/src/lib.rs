@@ -20,6 +20,7 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub quic_listener: String,
+    pub quic_profile: String,
     pub timestamp: DateTime<Utc>,
 }
 

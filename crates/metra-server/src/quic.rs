@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncSeekExt, AsyncWriteExt as TokioAsyncWriteExt, SeekFrom},
+    sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -30,6 +31,7 @@ use crate::{
 
 const PROGRESS_UPDATE_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHUNK_READ_BYTES: usize = 8 * 1024 * 1024;
+const RECEIVE_WRITE_PIPELINE_DEPTH: usize = 4;
 
 fn is_null_sink_uri(uri: &str) -> bool {
     uri.starts_with("null://") || uri.starts_with("memory://") || uri.starts_with("mem://")
@@ -460,8 +462,15 @@ async fn handle_quic_stream(
     let mut lane_metrics =
         LaneStreamMetricGuard::new(open.lane_index, total_lanes, striped, discard_payload);
 
-    let mut file = if discard_payload {
-        None
+    let expected_bytes = range_end_exclusive - resume_offset;
+    let stream_bytes_written = if discard_payload {
+        receive_lane_payload_no_disk(
+            &mut recv_stream,
+            expected_bytes,
+            open.transfer_id,
+            open.lane_index,
+        )
+        .await?
     } else {
         let mut file = OpenOptions::new()
             .create(true)
@@ -474,101 +483,22 @@ async fn handle_quic_stream(
         file.seek(SeekFrom::Start(resume_offset))
             .await
             .context("failed seeking staging file")?;
-        Some(file)
-    };
-
-    let expected_bytes = range_end_exclusive - resume_offset;
-    let mut stream_bytes_written: u64 = 0;
-    let mut since_update: u64 = 0;
-
-    loop {
-        if stream_bytes_written >= expected_bytes {
-            break;
-        }
-
-        let next = match recv_stream.read_chunk(MAX_CHUNK_READ_BYTES, true).await {
-            Ok(next) => next,
-            Err(err) => {
-                if since_update > 0 {
-                    persist_progress(
-                        &state,
-                        open.transfer_id,
-                        striped,
-                        &checkpoint_path,
-                        open.lane_index,
-                        resume_offset + stream_bytes_written,
-                    )
-                    .await?;
-                }
-                return Err(err).context("failed reading stream chunk");
-            }
-        };
-
-        let Some(chunk) = next else {
-            break;
-        };
-
-        let remaining = expected_bytes - stream_bytes_written;
-        let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
-        if let Some(file) = file.as_mut() {
-            file.write_all(&chunk.bytes[..to_write])
-                .await
-                .context("failed writing transfer chunk to disk")?;
-        }
-        if to_write < chunk.bytes.len() {
-            bail!(
-                "received lane payload overflow for transfer {} lane {}",
-                open.transfer_id,
-                open.lane_index
-            );
-        }
-
-        let chunk_size = to_write as u64;
-        stream_bytes_written += chunk_size;
-        since_update += chunk_size;
-        lane_metrics.add_bytes(chunk_size);
-
-        if since_update >= PROGRESS_UPDATE_INTERVAL_BYTES {
-            persist_progress(
-                &state,
-                open.transfer_id,
-                striped,
-                &checkpoint_path,
-                open.lane_index,
-                resume_offset + stream_bytes_written,
-            )
-            .await?;
-            since_update = 0;
-        }
-    }
-
-    if since_update > 0 {
-        persist_progress(
+        receive_lane_payload_to_file_pipelined(
             &state,
-            open.transfer_id,
-            striped,
-            &checkpoint_path,
-            open.lane_index,
-            resume_offset + stream_bytes_written,
+            &mut recv_stream,
+            file,
+            ReceiveLanePipelineArgs {
+                transfer_id: open.transfer_id,
+                striped,
+                checkpoint_path: checkpoint_path.clone(),
+                lane_index: open.lane_index,
+                resume_offset,
+                expected_bytes,
+            },
         )
-        .await?;
-    }
-
-    if stream_bytes_written != expected_bytes {
-        bail!(
-            "incomplete lane stream for transfer {} lane {}: got {} expected {}",
-            open.transfer_id,
-            open.lane_index,
-            stream_bytes_written,
-            expected_bytes
-        );
-    }
-
-    if let Some(file) = file.as_mut() {
-        file.flush()
-            .await
-            .context("failed flushing transfer file")?;
-    }
+        .await?
+    };
+    lane_metrics.add_bytes(stream_bytes_written);
 
     let complete = if striped {
         finalize_if_ready(
@@ -631,6 +561,173 @@ async fn handle_quic_stream(
     );
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ReceiveLanePipelineArgs {
+    transfer_id: Uuid,
+    striped: bool,
+    checkpoint_path: PathBuf,
+    lane_index: u32,
+    resume_offset: u64,
+    expected_bytes: u64,
+}
+
+async fn receive_lane_payload_no_disk(
+    recv_stream: &mut quinn::RecvStream,
+    expected_bytes: u64,
+    transfer_id: Uuid,
+    lane_index: u32,
+) -> Result<u64> {
+    let mut stream_bytes_written = 0u64;
+    loop {
+        if stream_bytes_written >= expected_bytes {
+            break;
+        }
+        let next = recv_stream
+            .read_chunk(MAX_CHUNK_READ_BYTES, true)
+            .await
+            .context("failed reading stream chunk")?;
+        let Some(chunk) = next else {
+            break;
+        };
+        let remaining = expected_bytes - stream_bytes_written;
+        let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
+        if to_write < chunk.bytes.len() {
+            bail!(
+                "received lane payload overflow for transfer {} lane {}",
+                transfer_id,
+                lane_index
+            );
+        }
+        stream_bytes_written += to_write as u64;
+    }
+    if stream_bytes_written != expected_bytes {
+        bail!(
+            "incomplete lane stream for transfer {} lane {}: got {} expected {}",
+            transfer_id,
+            lane_index,
+            stream_bytes_written,
+            expected_bytes
+        );
+    }
+    Ok(stream_bytes_written)
+}
+
+async fn receive_lane_payload_to_file_pipelined(
+    state: &AppState,
+    recv_stream: &mut quinn::RecvStream,
+    mut file: fs::File,
+    args: ReceiveLanePipelineArgs,
+) -> Result<u64> {
+    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(RECEIVE_WRITE_PIPELINE_DEPTH);
+    let state_for_writer = state.clone();
+    let writer_args = args.clone();
+    let writer_task = tokio::spawn(async move {
+        let mut bytes_written = 0u64;
+        let mut since_update = 0u64;
+        while let Some(chunk) = writer_rx.recv().await {
+            file.write_all(&chunk)
+                .await
+                .context("failed writing transfer chunk to disk")?;
+            let chunk_len = chunk.len() as u64;
+            bytes_written += chunk_len;
+            since_update += chunk_len;
+
+            if since_update >= PROGRESS_UPDATE_INTERVAL_BYTES {
+                persist_progress(
+                    &state_for_writer,
+                    writer_args.transfer_id,
+                    writer_args.striped,
+                    &writer_args.checkpoint_path,
+                    writer_args.lane_index,
+                    writer_args.resume_offset + bytes_written,
+                )
+                .await?;
+                since_update = 0;
+            }
+        }
+        if since_update > 0 {
+            persist_progress(
+                &state_for_writer,
+                writer_args.transfer_id,
+                writer_args.striped,
+                &writer_args.checkpoint_path,
+                writer_args.lane_index,
+                writer_args.resume_offset + bytes_written,
+            )
+            .await?;
+        }
+        file.flush()
+            .await
+            .context("failed flushing transfer file")?;
+        Ok::<u64, anyhow::Error>(bytes_written)
+    });
+
+    let mut bytes_received = 0u64;
+    let mut read_error: Option<anyhow::Error> = None;
+    while bytes_received < args.expected_bytes {
+        let next = match recv_stream.read_chunk(MAX_CHUNK_READ_BYTES, true).await {
+            Ok(next) => next,
+            Err(err) => {
+                read_error = Some(anyhow::Error::new(err).context("failed reading stream chunk"));
+                break;
+            }
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        let remaining = args.expected_bytes - bytes_received;
+        let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
+        if to_write < chunk.bytes.len() {
+            read_error = Some(anyhow::anyhow!(
+                "received lane payload overflow for transfer {} lane {}",
+                args.transfer_id,
+                args.lane_index
+            ));
+            break;
+        }
+
+        if writer_tx
+            .send(chunk.bytes[..to_write].to_vec())
+            .await
+            .is_err()
+        {
+            read_error = Some(anyhow::anyhow!(
+                "writer pipeline closed unexpectedly for transfer {} lane {}",
+                args.transfer_id,
+                args.lane_index
+            ));
+            break;
+        }
+        bytes_received += to_write as u64;
+    }
+
+    drop(writer_tx);
+    let writer_joined = writer_task.await.context("writer pipeline task panicked")?;
+    let bytes_written = writer_joined?;
+
+    if let Some(err) = read_error {
+        return Err(err);
+    }
+    if bytes_received != args.expected_bytes {
+        bail!(
+            "incomplete lane stream for transfer {} lane {}: got {} expected {}",
+            args.transfer_id,
+            args.lane_index,
+            bytes_received,
+            args.expected_bytes
+        );
+    }
+    if bytes_written != bytes_received {
+        bail!(
+            "lane {} writer mismatch: written {} != received {}",
+            args.lane_index,
+            bytes_written,
+            bytes_received
+        );
+    }
+    Ok(bytes_written)
 }
 
 async fn mark_transfer_started_if_absent(state: &AppState, transfer_id: Uuid) {

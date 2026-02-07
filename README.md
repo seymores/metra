@@ -115,6 +115,22 @@ cargo run --release -p metra-client -- --output json transfer matrix \
   --cleanup-files
 ```
 
+Run automated matrix sweep across requested QUIC profiles (optionally against per-profile servers):
+
+```bash
+cargo run --release -p metra-client -- --output json transfer matrix-profiles \
+  --profiles lan,wan,high-bdp \
+  --servers http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1:8082 \
+  --sizes-gib 1,2 \
+  --lanes 1,2 \
+  --io-chunk-bytes 16777216 \
+  --file-dir /tmp \
+  --cleanup-files
+```
+
+If `--servers` is omitted, all profiles run against the global `--server`. Output includes
+`detected_profile`, `profile_match`, and `profile_note` from `/health`.
+
 Run a no-disk benchmark (client generates payload, server uses null sink) to isolate transfer-path overhead from filesystem I/O:
 
 ```bash
@@ -258,7 +274,7 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - Multi-lane transfer is currently an early implementation and still needs hardening.
 - Data plane supports local disk target and null-sink benchmark target; no S3 path yet.
 - Striped resume checkpointing is implemented, but still needs adversarial/fault-injection test coverage.
-- No FEC, no multi-path QUIC, and no automated transport/profile sweep harness yet.
+- No FEC, no multi-path QUIC, and no congestion-controller tuning sweep harness yet.
 - Browser helper and extension are still pending implementation.
 
 ## TODO and Plan
@@ -296,10 +312,11 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 
 - [ ] Implement bounded pipeline stages for read/encrypt-send/receive-write.
   - Client file-source read/send path now uses bounded pipelining with backpressure and buffer reuse.
-  - Server receive/write bounded pipeline still pending.
+  - Server receive/write path now uses bounded read->write pipelining with backpressure.
 - [x] Add per-lane and aggregate throughput metrics via OpenTelemetry.
 - [ ] Add CPU and runtime tuning profile (thread affinity, buffer sizing).
 - [ ] Add WAN test profiles (`tc/netem`) and record p50/p95 throughput.
+- [x] Add automated benchmark profile sweep (`transfer matrix-profiles`) with profile detection.
 
 ### Reliability and Data Integrity
 

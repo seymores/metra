@@ -1,12 +1,29 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum QuicTransportProfile {
     Lan,
     Wan,
     HighBdp,
+}
+
+impl QuicTransportProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Wan => "wan",
+            Self::HighBdp => "high-bdp",
+        }
+    }
+}
+
+impl fmt::Display for QuicTransportProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str((*self).as_str())
+    }
 }
 
 #[derive(Debug, Parser)]

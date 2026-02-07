@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
         args.quic_addr,
         args.data_dir.clone(),
         args.quic_server_name.clone(),
+        args.quic_profile.to_string(),
         BASE64.encode(cert_der),
     );
 

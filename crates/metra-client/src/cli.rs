@@ -10,6 +10,23 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum QuicProfile {
+    Lan,
+    Wan,
+    HighBdp,
+}
+
+impl QuicProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Wan => "wan",
+            Self::HighBdp => "high-bdp",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "metra-client", about = "Metra TUI + scriptable CLI client")]
 pub struct Cli {
@@ -38,6 +55,7 @@ pub enum TransferAction {
     Send(SendArgs),
     Bench(BenchArgs),
     Matrix(MatrixArgs),
+    MatrixProfiles(MatrixProfilesArgs),
     Compare(CompareArgs),
     CompareSeries(CompareSeriesArgs),
     TuneLanes(TuneLanesArgs),
@@ -113,7 +131,7 @@ pub struct BenchArgs {
     pub lane_policy: Option<PathBuf>,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct MatrixArgs {
     #[arg(long, value_delimiter = ',', default_value = "4,16")]
     pub sizes_gib: Vec<u64>,
@@ -143,6 +161,16 @@ pub struct MatrixArgs {
     pub auto_lanes_report: Option<PathBuf>,
     #[arg(long)]
     pub lane_policy: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct MatrixProfilesArgs {
+    #[arg(long, value_delimiter = ',', default_value = "lan,wan,high-bdp")]
+    pub profiles: Vec<QuicProfile>,
+    #[arg(long, value_delimiter = ',')]
+    pub servers: Vec<String>,
+    #[command(flatten)]
+    pub matrix: MatrixArgs,
 }
 
 #[derive(Debug, clap::Args)]

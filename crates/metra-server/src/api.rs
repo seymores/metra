@@ -32,6 +32,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         quic_listener: state.quic_addr.to_string(),
+        quic_profile: state.quic_profile.to_string(),
         timestamp: Utc::now(),
     })
 }

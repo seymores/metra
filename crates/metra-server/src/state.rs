@@ -11,6 +11,7 @@ pub struct AppState {
     pub quic_addr: SocketAddr,
     pub data_dir: Arc<PathBuf>,
     pub quic_server_name: Arc<String>,
+    pub quic_profile: Arc<String>,
     pub quic_cert_der_b64: Arc<String>,
     pub finalize_lock: Arc<Mutex<()>>,
     pub checkpoint_lock: Arc<Mutex<()>>,
@@ -21,6 +22,7 @@ impl AppState {
         quic_addr: SocketAddr,
         data_dir: PathBuf,
         quic_server_name: String,
+        quic_profile: String,
         quic_cert_der_b64: String,
     ) -> Self {
         Self {
@@ -29,6 +31,7 @@ impl AppState {
             quic_addr,
             data_dir: Arc::new(data_dir),
             quic_server_name: Arc::new(quic_server_name),
+            quic_profile: Arc::new(quic_profile),
             quic_cert_der_b64: Arc::new(quic_cert_der_b64),
             finalize_lock: Arc::new(Mutex::new(())),
             checkpoint_lock: Arc::new(Mutex::new(())),

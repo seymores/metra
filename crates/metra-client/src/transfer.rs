@@ -27,14 +27,15 @@ use uuid::Uuid;
 
 use crate::{
     cli::{
-        BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, SendArgs, TuneLanesArgs,
+        BenchArgs, CompareArgs, CompareSeriesArgs, CreateArgs, MatrixArgs, MatrixProfilesArgs,
+        SendArgs, TuneLanesArgs,
     },
     lane_policy::{
         LanePolicyEntry, WorkloadProfile, read_lane_policy, select_lane_policy,
         upsert_lane_policy_entry,
     },
     quic::{connect_quic, read_json_frame, write_json_frame},
-    rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
+    rest::{create_transfer, fetch_health, fetch_quic_certificate, fetch_transfer_status},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +81,34 @@ pub struct BenchmarkMatrixReport {
     failed_runs: usize,
     best_run: Option<BenchmarkMatrixRun>,
     runs: Vec<BenchmarkMatrixRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkMatrixProfileRow {
+    requested_profile: String,
+    server: String,
+    detected_profile: Option<String>,
+    profile_match: Option<bool>,
+    profile_note: Option<String>,
+    matrix: BenchmarkMatrixReport,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkMatrixProfilesReport {
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    total_profiles: usize,
+    successful_profiles: usize,
+    failed_profiles: usize,
+    best_overall_run: Option<BenchmarkMatrixProfilesBestRun>,
+    rows: Vec<BenchmarkMatrixProfileRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkMatrixProfilesBestRun {
+    requested_profile: String,
+    server: String,
+    run: BenchmarkMatrixRun,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,6 +438,98 @@ pub async fn run_benchmark_matrix(
         failed_runs,
         best_run,
         runs,
+    })
+}
+
+pub async fn run_benchmark_matrix_profiles(
+    http: &Client,
+    default_server: &str,
+    args: MatrixProfilesArgs,
+) -> Result<BenchmarkMatrixProfilesReport> {
+    if args.profiles.is_empty() {
+        anyhow::bail!("profiles must contain at least one value");
+    }
+    if !args.servers.is_empty() && args.servers.len() != args.profiles.len() {
+        anyhow::bail!(
+            "servers must be empty or have the same number of entries as profiles (profiles={}, servers={})",
+            args.profiles.len(),
+            args.servers.len()
+        );
+    }
+
+    let servers = if args.servers.is_empty() {
+        vec![default_server.to_owned(); args.profiles.len()]
+    } else {
+        args.servers.clone()
+    };
+
+    let started_at = Utc::now();
+    let mut rows = Vec::with_capacity(args.profiles.len());
+
+    for (idx, profile) in args.profiles.iter().copied().enumerate() {
+        let server = servers[idx].clone();
+        let detected_profile = fetch_health(http, &server)
+            .await
+            .ok()
+            .map(|health| health.quic_profile);
+        let profile_suffix = profile.as_str();
+        let profile_match = detected_profile
+            .as_ref()
+            .map(|value| value.eq_ignore_ascii_case(profile_suffix));
+        let profile_note = match (detected_profile.as_ref(), profile_match) {
+            (Some(detected), Some(false)) => Some(format!(
+                "requested profile '{}' but server reports '{}'",
+                profile_suffix, detected
+            )),
+            _ => None,
+        };
+        let mut matrix_args = args.matrix.clone();
+        matrix_args.destination_prefix = format!(
+            "{}/{}",
+            matrix_args.destination_prefix.trim_end_matches('/'),
+            profile_suffix
+        );
+        matrix_args.file_dir = matrix_args
+            .file_dir
+            .join(format!("profile-{profile_suffix}"));
+        let matrix = run_benchmark_matrix(http, &server, matrix_args).await?;
+        rows.push(BenchmarkMatrixProfileRow {
+            requested_profile: profile_suffix.to_owned(),
+            server,
+            detected_profile,
+            profile_match,
+            profile_note,
+            matrix,
+        });
+    }
+
+    let successful_profiles = rows
+        .iter()
+        .filter(|row| row.matrix.failed_runs == 0)
+        .count();
+    let failed_profiles = rows.len().saturating_sub(successful_profiles);
+    let best_overall_run = rows
+        .iter()
+        .filter_map(|row| row.matrix.best_run.as_ref().map(|run| (row, run)))
+        .max_by(|(_, left), (_, right)| {
+            left.average_gbps
+                .unwrap_or(0.0)
+                .total_cmp(&right.average_gbps.unwrap_or(0.0))
+        })
+        .map(|(row, run)| BenchmarkMatrixProfilesBestRun {
+            requested_profile: row.requested_profile.clone(),
+            server: row.server.clone(),
+            run: run.clone(),
+        });
+
+    Ok(BenchmarkMatrixProfilesReport {
+        started_at,
+        completed_at: Utc::now(),
+        total_profiles: rows.len(),
+        successful_profiles,
+        failed_profiles,
+        best_overall_run,
+        rows,
     })
 }
 
