@@ -42,8 +42,15 @@ cargo build
 cargo run --release -p metra-server -- \
   --rest-addr 127.0.0.1:8080 \
   --quic-addr 127.0.0.1:8443 \
-  --data-dir /Users/ping/Projects/metra/var/data
+  --data-dir /Users/ping/Projects/metra/var/data \
+  --quic-profile lan
 ```
+
+`--quic-profile` options:
+
+- `lan`: low-latency datacenter/LAN baseline.
+- `wan`: lower receive/send windows with longer idle timeout.
+- `high-bdp`: larger windows for long-fat networks.
 
 ### 3) Check Health (CLI)
 
@@ -251,7 +258,7 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - Multi-lane transfer is currently an early implementation and still needs hardening.
 - Data plane supports local disk target and null-sink benchmark target; no S3 path yet.
 - Striped resume checkpointing is implemented, but still needs adversarial/fault-injection test coverage.
-- No FEC, no multi-path QUIC, no congestion-controller tuning profiles yet.
+- No FEC, no multi-path QUIC, and no automated transport/profile sweep harness yet.
 - Browser helper and extension are still pending implementation.
 
 ## TODO and Plan
@@ -283,6 +290,7 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 - [x] Add host/runtime telemetry to compare reports (start/phase/end snapshots and deltas).
 - [x] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
 - [x] Add lane-policy persistence by workload profile (size/concurrency) and automatic fallback.
+- [x] Add server QUIC transport profiles (`--quic-profile lan|wan|high-bdp`).
 
 ### Near-term Performance Roadmap
 

@@ -29,7 +29,8 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let (endpoint, cert_der) = quic::build_quic_endpoint(args.quic_addr, &args.quic_server_name)?;
+    let (endpoint, cert_der) =
+        quic::build_quic_endpoint(args.quic_addr, &args.quic_server_name, args.quic_profile)?;
     let app_state = AppState::new(
         args.quic_addr,
         args.data_dir.clone(),
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
     info!(
         rest_addr = %args.rest_addr,
         quic_addr = %args.quic_addr,
+        quic_profile = ?args.quic_profile,
         data_dir = %args.data_dir.display(),
         "metra server started"
     );

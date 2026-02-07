@@ -1,6 +1,13 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum QuicTransportProfile {
+    Lan,
+    Wan,
+    HighBdp,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -16,4 +23,11 @@ pub struct Args {
     pub data_dir: PathBuf,
     #[arg(long, env = "METRA_QUIC_SERVER_NAME", default_value = "localhost")]
     pub quic_server_name: String,
+    #[arg(
+        long,
+        env = "METRA_QUIC_PROFILE",
+        value_enum,
+        default_value_t = QuicTransportProfile::Lan
+    )]
+    pub quic_profile: QuicTransportProfile,
 }

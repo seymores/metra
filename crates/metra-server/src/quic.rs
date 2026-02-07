@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    args::QuicTransportProfile,
     quic_metrics,
     state::AppState,
     wire::{read_json_frame, write_json_frame},
@@ -213,6 +214,7 @@ pub async fn run_quic_listener(
 pub fn build_quic_endpoint(
     bind_addr: SocketAddr,
     server_name: &str,
+    profile: QuicTransportProfile,
 ) -> Result<(quinn::Endpoint, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec![server_name.to_owned()])
         .context("failed generating self-signed certificate")?;
@@ -233,16 +235,44 @@ pub fn build_quic_endpoint(
 
     let transport_config = Arc::get_mut(&mut server_config.transport)
         .context("failed accessing QUIC transport config")?;
-    transport_config.max_concurrent_bidi_streams(4_096u32.into());
-    transport_config.max_concurrent_uni_streams(1_024u32.into());
-    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
-    transport_config.max_idle_timeout(Some(Duration::from_secs(120).try_into()?));
-    transport_config.send_window(2 * 1024 * 1024 * 1024);
+    apply_transport_profile(transport_config, profile)?;
 
     let endpoint = quinn::Endpoint::server(server_config, bind_addr)
         .with_context(|| format!("failed binding QUIC endpoint on {bind_addr}"))?;
 
     Ok((endpoint, cert_der))
+}
+
+fn apply_transport_profile(
+    transport_config: &mut quinn::TransportConfig,
+    profile: QuicTransportProfile,
+) -> Result<()> {
+    transport_config.max_concurrent_bidi_streams(4_096u32.into());
+    transport_config.max_concurrent_uni_streams(1_024u32.into());
+    match profile {
+        QuicTransportProfile::Lan => {
+            transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+            transport_config.max_idle_timeout(Some(Duration::from_secs(120).try_into()?));
+            transport_config.send_window(2 * 1024 * 1024 * 1024);
+            transport_config.stream_receive_window((64 * 1024 * 1024u32).into());
+            transport_config.receive_window((512 * 1024 * 1024u32).into());
+        }
+        QuicTransportProfile::Wan => {
+            transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+            transport_config.max_idle_timeout(Some(Duration::from_secs(180).try_into()?));
+            transport_config.send_window(1024 * 1024 * 1024);
+            transport_config.stream_receive_window((32 * 1024 * 1024u32).into());
+            transport_config.receive_window((256 * 1024 * 1024u32).into());
+        }
+        QuicTransportProfile::HighBdp => {
+            transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+            transport_config.max_idle_timeout(Some(Duration::from_secs(240).try_into()?));
+            transport_config.send_window(4 * 1024 * 1024 * 1024);
+            transport_config.stream_receive_window((128 * 1024 * 1024u32).into());
+            transport_config.receive_window((1024 * 1024 * 1024u32).into());
+        }
+    }
+    Ok(())
 }
 
 async fn handle_quic_connection(state: AppState, connection: quinn::Connection) -> Result<()> {
