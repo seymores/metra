@@ -153,6 +153,8 @@ pub struct CompareArgs {
     pub io_chunk_bytes: usize,
     #[arg(long, default_value_t = 1)]
     pub lanes: u32,
+    #[arg(long, default_value_t = 3)]
+    pub iterations: u32,
     #[arg(long, default_value_t = true)]
     pub cleanup_file: bool,
 }

@@ -29,7 +29,7 @@ use crate::{
     rest::{create_transfer, fetch_quic_certificate, fetch_transfer_status},
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SendTransferReport {
     transfer_id: Uuid,
     file_path: String,
@@ -78,11 +78,32 @@ pub struct BenchmarkCompareReport {
     size_gib: u64,
     lanes: u32,
     io_chunk_bytes: usize,
+    iterations: u32,
+    disk_backed: ThroughputStats,
+    no_disk: ThroughputStats,
+    delta_gbps: ThroughputStats,
+    delta_percent_over_disk: ThroughputStats,
+    disk_fraction_of_no_disk: ThroughputStats,
+    runs: Vec<BenchmarkCompareIteration>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkCompareIteration {
+    iteration: u32,
     disk_backed: SendTransferReport,
     no_disk: SendTransferReport,
     delta_gbps: f64,
     delta_percent_over_disk: f64,
     disk_fraction_of_no_disk: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThroughputStats {
+    min: f64,
+    p50: f64,
+    p95: f64,
+    max: f64,
+    mean: f64,
 }
 
 #[derive(Clone)]
@@ -291,34 +312,60 @@ pub async fn run_benchmark_compare(
     if args.io_chunk_bytes == 0 {
         anyhow::bail!("io_chunk_bytes must be > 0");
     }
+    if args.iterations == 0 {
+        anyhow::bail!("iterations must be > 0");
+    }
 
     let started_at = Utc::now();
+    let mut runs = Vec::with_capacity(args.iterations as usize);
+    for iteration in 1..=args.iterations {
+        let disk_args = BenchArgs {
+            size_gib: args.size_gib,
+            file_path: args.file_path.clone(),
+            tenant_id: args.tenant_id.clone(),
+            user_id: args.user_id.clone(),
+            destination_uri: args.destination_uri.clone(),
+            quic_addr: args.quic_addr,
+            io_chunk_bytes: args.io_chunk_bytes,
+            lanes: args.lanes,
+            no_disk: false,
+        };
+        let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
 
-    let disk_args = BenchArgs {
-        size_gib: args.size_gib,
-        file_path: args.file_path.clone(),
-        tenant_id: args.tenant_id.clone(),
-        user_id: args.user_id.clone(),
-        destination_uri: args.destination_uri.clone(),
-        quic_addr: args.quic_addr,
-        io_chunk_bytes: args.io_chunk_bytes,
-        lanes: args.lanes,
-        no_disk: false,
-    };
-    let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
+        let no_disk_args = BenchArgs {
+            size_gib: args.size_gib,
+            file_path: args.file_path.clone(),
+            tenant_id: args.tenant_id.clone(),
+            user_id: args.user_id.clone(),
+            destination_uri: args.destination_uri.clone(),
+            quic_addr: args.quic_addr,
+            io_chunk_bytes: args.io_chunk_bytes,
+            lanes: args.lanes,
+            no_disk: true,
+        };
+        let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
 
-    let no_disk_args = BenchArgs {
-        size_gib: args.size_gib,
-        file_path: args.file_path.clone(),
-        tenant_id: args.tenant_id,
-        user_id: args.user_id,
-        destination_uri: args.destination_uri,
-        quic_addr: args.quic_addr,
-        io_chunk_bytes: args.io_chunk_bytes,
-        lanes: args.lanes,
-        no_disk: true,
-    };
-    let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
+        let delta_gbps = no_disk.average_gbps - disk_backed.average_gbps;
+        let delta_percent_over_disk = if disk_backed.average_gbps > 0.0 {
+            (delta_gbps / disk_backed.average_gbps) * 100.0
+        } else {
+            0.0
+        };
+        let disk_fraction_of_no_disk = if no_disk.average_gbps > 0.0 {
+            disk_backed.average_gbps / no_disk.average_gbps
+        } else {
+            0.0
+        };
+
+        runs.push(BenchmarkCompareIteration {
+            iteration,
+            disk_backed,
+            no_disk,
+            delta_gbps,
+            delta_percent_over_disk,
+            disk_fraction_of_no_disk,
+        });
+    }
 
     if args.cleanup_file {
         match fs::remove_file(&args.file_path).await {
@@ -334,17 +381,23 @@ pub async fn run_benchmark_compare(
         }
     }
 
-    let delta_gbps = no_disk.average_gbps - disk_backed.average_gbps;
-    let delta_percent_over_disk = if disk_backed.average_gbps > 0.0 {
-        (delta_gbps / disk_backed.average_gbps) * 100.0
-    } else {
-        0.0
-    };
-    let disk_fraction_of_no_disk = if no_disk.average_gbps > 0.0 {
-        disk_backed.average_gbps / no_disk.average_gbps
-    } else {
-        0.0
-    };
+    let disk_values = runs
+        .iter()
+        .map(|run| run.disk_backed.average_gbps)
+        .collect::<Vec<_>>();
+    let no_disk_values = runs
+        .iter()
+        .map(|run| run.no_disk.average_gbps)
+        .collect::<Vec<_>>();
+    let delta_values = runs.iter().map(|run| run.delta_gbps).collect::<Vec<_>>();
+    let delta_percent_values = runs
+        .iter()
+        .map(|run| run.delta_percent_over_disk)
+        .collect::<Vec<_>>();
+    let fraction_values = runs
+        .iter()
+        .map(|run| run.disk_fraction_of_no_disk)
+        .collect::<Vec<_>>();
 
     Ok(BenchmarkCompareReport {
         server: server.to_owned(),
@@ -353,11 +406,13 @@ pub async fn run_benchmark_compare(
         size_gib: args.size_gib,
         lanes: args.lanes,
         io_chunk_bytes: args.io_chunk_bytes,
-        disk_backed,
-        no_disk,
-        delta_gbps,
-        delta_percent_over_disk,
-        disk_fraction_of_no_disk,
+        iterations: args.iterations,
+        disk_backed: summarize_values(&disk_values),
+        no_disk: summarize_values(&no_disk_values),
+        delta_gbps: summarize_values(&delta_values),
+        delta_percent_over_disk: summarize_values(&delta_percent_values),
+        disk_fraction_of_no_disk: summarize_values(&fraction_values),
+        runs,
     })
 }
 
@@ -713,6 +768,49 @@ async fn report_progress(
             break;
         }
     }
+}
+
+fn summarize_values(values: &[f64]) -> ThroughputStats {
+    let mut sorted = values.to_vec();
+    if sorted.is_empty() {
+        return ThroughputStats {
+            min: 0.0,
+            p50: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            mean: 0.0,
+        };
+    }
+
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+
+    ThroughputStats {
+        min: *sorted.first().unwrap_or(&0.0),
+        p50: percentile(&sorted, 0.50),
+        p95: percentile(&sorted, 0.95),
+        max: *sorted.last().unwrap_or(&0.0),
+        mean,
+    }
+}
+
+fn percentile(sorted: &[f64], quantile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+
+    let rank = quantile.clamp(0.0, 1.0) * (sorted.len() as f64 - 1.0);
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+
+    let weight = rank - lower as f64;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * weight
 }
 
 async fn prepare_sparse_file(path: &Path, size: u64) -> Result<()> {

@@ -127,6 +127,7 @@ cargo run --release -p metra-client -- --output json transfer compare \
   --file-path /tmp/metra-bench-compare-2g.bin \
   --io-chunk-bytes 16777216 \
   --lanes 2 \
+  --iterations 3 \
   --cleanup-file
 ```
 
@@ -149,6 +150,10 @@ cargo run --release -p metra-client -- --output json transfer compare \
 - Release client + release server (4 GiB, disk-backed, 2 lanes, 16 MiB chunks): ~1.18 Gbps.
 - Release client + release server (4 GiB, `--no-disk`, 2 lanes, 16 MiB chunks): ~1.81 Gbps.
 - Compare run (2 GiB, 2 lanes, 16 MiB): disk `~1.21 Gbps`, no-disk `~1.88 Gbps`, delta `+56.24%`.
+- Compare run (2 GiB, 2 lanes, 16 MiB, 3 iterations):
+  - disk p50 `~1.20 Gbps`, p95 `~1.23 Gbps`
+  - no-disk p50 `~1.86 Gbps`, p95 `~1.89 Gbps`
+  - delta p50 `~0.66 Gbps` (`+53.77%`), p95 `~0.67 Gbps` (`+55.55%`)
 - Resume retry test (8 GiB, interrupted then resumed): completed with `resumed_from_bytes = 1458886460`.
 - Striped resume retry test (2 GiB, 4 lanes, interrupted then resumed): completed with `resumed_from_bytes = 1879054862`.
 
@@ -170,6 +175,7 @@ These measurements are local environment baselines and do not represent target W
 - [x] Add multi-lane transfer support (`--lanes`) for parallel QUIC streams.
 - [ ] Validate and tune lane scheduling for higher throughput under load.
 - [x] Add automated benchmark matrix for lane/chunk combinations (`transfer matrix`).
+- [x] Add repeated compare benchmark with p50/p95 reporting (`transfer compare --iterations`).
 
 ### Near-term Performance Roadmap
 
