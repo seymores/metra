@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    env,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -10,8 +12,10 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use metra_proto::{
-    CreateTransferRequest, QUIC_PROTOCOL_VERSION, QuicTransferCompleteAck, QuicTransferOpen,
-    QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES, TransferStatus,
+    APP_PAYLOAD_CODEC_DEFAULT, APP_RECEIVE_WRITE_PIPELINE_DEPTH_DEFAULT, AeadLaneCodec,
+    CreateTransferRequest, PayloadCodec, QUIC_PROTOCOL_VERSION, QuicTransferCompleteAck,
+    QuicTransferOpen, QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES, TransferStatus,
+    encode_payload_frame, normalize_receive_write_pipeline_depth,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -48,9 +52,12 @@ pub struct SendTransferReport {
     file_path: String,
     file_size_bytes: u64,
     effective_lanes: u32,
+    payload_codec: String,
     runtime_profile: Option<String>,
     effective_io_chunk_bytes: usize,
     file_read_pipeline_depth: usize,
+    send_transform_pipeline_depth: usize,
+    receive_write_pipeline_depth: usize,
     runtime_selection: Option<String>,
     lane_selection: Option<String>,
     resumed_from_bytes: u64,
@@ -229,6 +236,12 @@ pub struct TuneRuntimeProfileResult {
     runtime_profile: String,
     effective_io_chunk_bytes: Option<usize>,
     file_read_pipeline_depth: Option<usize>,
+    #[serde(default)]
+    send_transform_pipeline_depth: Option<usize>,
+    #[serde(default)]
+    receive_write_pipeline_depth: Option<usize>,
+    #[serde(default)]
+    payload_codec: Option<String>,
     runtime_selection: Option<String>,
     throughput_gbps: ThroughputStats,
     successful_runs: u32,
@@ -309,8 +322,11 @@ struct LaneConfig {
     file_name: String,
     resume_chunk_size_bytes: u64,
     source: PayloadSource,
+    payload_codec: PayloadCodec,
     io_chunk_bytes: usize,
     file_read_pipeline_depth: usize,
+    send_transform_pipeline_depth: usize,
+    receive_write_pipeline_depth: usize,
     lane_index: u32,
     total_lanes: u32,
     range_start: u64,
@@ -340,6 +356,212 @@ struct LaneTransferResult {
 
 const DEFAULT_IO_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_FILE_READ_PIPELINE_DEPTH: usize = 4;
+const DEFAULT_TENANT_ID: &str = "default-tenant";
+const DEFAULT_USER_ID: &str = "default-user";
+const DEFAULT_CPU_GUARDRAIL_PERCENT: f64 = 80.0;
+
+#[derive(Debug, Clone)]
+struct ClientDefaults {
+    tenant_id: String,
+    user_id: String,
+    runtime_policy_path: PathBuf,
+    lane_policy_path: PathBuf,
+    auto_policy_update: bool,
+    cpu_guardrail_percent: f64,
+    destinations: HashMap<String, String>,
+}
+
+impl ClientDefaults {
+    fn built_in() -> Self {
+        let home = metra_home_dir();
+        Self {
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
+            user_id: DEFAULT_USER_ID.to_owned(),
+            runtime_policy_path: home.join("runtime-policy.json"),
+            lane_policy_path: home.join("lane-policy.json"),
+            auto_policy_update: true,
+            cpu_guardrail_percent: DEFAULT_CPU_GUARDRAIL_PERCENT,
+            destinations: HashMap::new(),
+        }
+    }
+}
+
+fn metra_home_dir() -> PathBuf {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".metra")
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn strip_quote_wrappers(value: &str) -> &str {
+    let trimmed = value.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        return &trimmed[1..trimmed.len().saturating_sub(1)];
+    }
+    trimmed
+}
+
+fn normalize_destination_account(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn apply_metrarc_line(defaults: &mut ClientDefaults, raw_line: &str) {
+    let line = raw_line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    let Some((raw_key, raw_value)) = line.split_once('=') else {
+        return;
+    };
+    let key = raw_key.trim();
+    let value = strip_quote_wrappers(raw_value).trim();
+    if key.is_empty() || value.is_empty() {
+        return;
+    }
+    if let Some(account) = key.strip_prefix("destination.") {
+        defaults
+            .destinations
+            .insert(normalize_destination_account(account), value.to_owned());
+        return;
+    }
+    match key {
+        "tenant_id" => defaults.tenant_id = value.to_owned(),
+        "user_id" => defaults.user_id = value.to_owned(),
+        "runtime_policy_path" => defaults.runtime_policy_path = PathBuf::from(value),
+        "lane_policy_path" => defaults.lane_policy_path = PathBuf::from(value),
+        "auto_policy_update" => {
+            if let Some(parsed) = parse_bool(value) {
+                defaults.auto_policy_update = parsed;
+            }
+        }
+        "cpu_guardrail_percent" => {
+            if let Ok(parsed) = value.parse::<f64>() {
+                defaults.cpu_guardrail_percent = parsed.max(0.0);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_metrarc_file(defaults: &mut ClientDefaults, path: &Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in contents.lines() {
+        apply_metrarc_line(defaults, line);
+    }
+}
+
+fn apply_env_overrides(defaults: &mut ClientDefaults) {
+    if let Ok(value) = env::var("METRA_TENANT_ID") {
+        if !value.trim().is_empty() {
+            defaults.tenant_id = value;
+        }
+    }
+    if let Ok(value) = env::var("METRA_USER_ID") {
+        if !value.trim().is_empty() {
+            defaults.user_id = value;
+        }
+    }
+    if let Ok(value) = env::var("METRA_RUNTIME_POLICY_PATH") {
+        if !value.trim().is_empty() {
+            defaults.runtime_policy_path = PathBuf::from(value);
+        }
+    }
+    if let Ok(value) = env::var("METRA_LANE_POLICY_PATH") {
+        if !value.trim().is_empty() {
+            defaults.lane_policy_path = PathBuf::from(value);
+        }
+    }
+    if let Ok(value) = env::var("METRA_AUTO_POLICY_UPDATE") {
+        if let Some(parsed) = parse_bool(&value) {
+            defaults.auto_policy_update = parsed;
+        }
+    }
+    if let Ok(value) = env::var("METRA_CPU_GUARDRAIL_PERCENT") {
+        if let Ok(parsed) = value.parse::<f64>() {
+            defaults.cpu_guardrail_percent = parsed.max(0.0);
+        }
+    }
+}
+
+fn load_client_defaults() -> ClientDefaults {
+    let mut defaults = ClientDefaults::built_in();
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    apply_metrarc_file(&mut defaults, &home.join(".metrarc"));
+    apply_metrarc_file(&mut defaults, &home.join(".metra").join(".metrarc"));
+    if let Ok(cwd) = env::current_dir() {
+        apply_metrarc_file(&mut defaults, &cwd.join(".metrarc"));
+    }
+    apply_env_overrides(&mut defaults);
+    defaults
+}
+
+fn env_destination_var_name(account: &str) -> String {
+    let mut out = String::from("METRA_DESTINATION_");
+    for ch in account.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+fn compose_destination_uri(base: &str, file_name: &str) -> String {
+    if base.contains("{file_name}") {
+        return base.replace("{file_name}", file_name);
+    }
+    if base.ends_with('/') || base.ends_with("://") {
+        return format!("{base}{file_name}");
+    }
+    base.to_owned()
+}
+
+fn resolve_destination_uri(
+    destination: Option<&str>,
+    file_name: &str,
+    defaults: &ClientDefaults,
+) -> Result<String> {
+    let destination = destination
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("destination is required unless --transfer-id is provided")?;
+    if destination.contains("://") {
+        return Ok(compose_destination_uri(destination, file_name));
+    }
+    let account_key = normalize_destination_account(destination);
+    if let Some(configured) = defaults.destinations.get(&account_key) {
+        return Ok(compose_destination_uri(configured, file_name));
+    }
+    let env_key = env_destination_var_name(&account_key);
+    if let Ok(configured) = env::var(&env_key) {
+        if !configured.trim().is_empty() {
+            return Ok(compose_destination_uri(configured.trim(), file_name));
+        }
+    }
+    anyhow::bail!(
+        "unknown destination account '{}'; define destination.{} in .metrarc (or set {}) or provide a full destination URI",
+        destination,
+        destination,
+        env_key
+    );
+}
 
 fn default_tune_runtime_io_chunk_bytes() -> usize {
     DEFAULT_IO_CHUNK_BYTES
@@ -349,13 +571,19 @@ fn default_tune_runtime_io_chunk_bytes() -> usize {
 struct RuntimePreset {
     io_chunk_bytes: usize,
     file_read_pipeline_depth: usize,
+    send_transform_pipeline_depth: usize,
+    receive_write_pipeline_depth: usize,
+    payload_codec: PayloadCodec,
 }
 
 #[derive(Debug, Clone)]
 struct RuntimeTuning {
     runtime_profile: Option<RuntimeProfile>,
+    payload_codec: PayloadCodec,
     effective_io_chunk_bytes: usize,
     file_read_pipeline_depth: usize,
+    send_transform_pipeline_depth: usize,
+    receive_write_pipeline_depth: usize,
     runtime_selection: Option<String>,
 }
 
@@ -386,14 +614,23 @@ fn runtime_preset(profile: RuntimeProfile) -> RuntimePreset {
         RuntimeProfile::Balanced => RuntimePreset {
             io_chunk_bytes: DEFAULT_IO_CHUNK_BYTES,
             file_read_pipeline_depth: 4,
+            send_transform_pipeline_depth: 4,
+            receive_write_pipeline_depth: 4,
+            payload_codec: PayloadCodec::AeadV1,
         },
         RuntimeProfile::Throughput => RuntimePreset {
-            io_chunk_bytes: 16 * 1024 * 1024,
-            file_read_pipeline_depth: 8,
+            io_chunk_bytes: 32 * 1024 * 1024,
+            file_read_pipeline_depth: 10,
+            send_transform_pipeline_depth: 12,
+            receive_write_pipeline_depth: 8,
+            payload_codec: PayloadCodec::AeadV1,
         },
         RuntimeProfile::LowCpu => RuntimePreset {
             io_chunk_bytes: 4 * 1024 * 1024,
             file_read_pipeline_depth: 2,
+            send_transform_pipeline_depth: 2,
+            receive_write_pipeline_depth: 2,
+            payload_codec: PayloadCodec::RawV1,
         },
     }
 }
@@ -427,20 +664,45 @@ fn resolve_runtime_tuning(
             .map(|value| value.file_read_pipeline_depth)
             .unwrap_or(DEFAULT_FILE_READ_PIPELINE_DEPTH)
     });
+    let send_transform_pipeline_depth = if requested_file_read_pipeline_depth.is_some() {
+        file_read_pipeline_depth
+    } else {
+        preset
+            .map(|value| value.send_transform_pipeline_depth)
+            .unwrap_or(file_read_pipeline_depth)
+    };
+    let receive_write_pipeline_depth = if requested_file_read_pipeline_depth.is_some() {
+        normalize_receive_write_pipeline_depth(file_read_pipeline_depth)
+    } else {
+        normalize_receive_write_pipeline_depth(
+            preset
+                .map(|value| value.receive_write_pipeline_depth)
+                .unwrap_or(APP_RECEIVE_WRITE_PIPELINE_DEPTH_DEFAULT),
+        )
+    };
+    let payload_codec = preset.map(|value| value.payload_codec).unwrap_or(
+        PayloadCodec::from_wire(APP_PAYLOAD_CODEC_DEFAULT).unwrap_or(PayloadCodec::AeadV1),
+    );
 
     let runtime_selection = runtime_profile.map(|profile| {
         format!(
-            "runtime-profile={} io_chunk_bytes={} file_read_pipeline_depth={}",
+            "runtime-profile={} io_chunk_bytes={} file_read_pipeline_depth={} send_transform_pipeline_depth={} receive_write_pipeline_depth={} payload_codec={}",
             profile.as_str(),
             effective_io_chunk_bytes,
-            file_read_pipeline_depth
+            file_read_pipeline_depth,
+            send_transform_pipeline_depth,
+            receive_write_pipeline_depth,
+            payload_codec.as_wire()
         )
     });
 
     Ok(RuntimeTuning {
         runtime_profile,
+        payload_codec,
         effective_io_chunk_bytes,
         file_read_pipeline_depth,
+        send_transform_pipeline_depth,
+        receive_write_pipeline_depth,
         runtime_selection,
     })
 }
@@ -551,6 +813,7 @@ pub async fn run_benchmark_matrix(
                     lane_policy: args.lane_policy.clone(),
                     auto_runtime_report: args.auto_runtime_report.clone(),
                     runtime_policy: args.runtime_policy.clone(),
+                    runtime_policy_out: None,
                     runtime_profile: args.runtime_profile,
                     file_read_pipeline_depth: args.file_read_pipeline_depth,
                 };
@@ -747,6 +1010,11 @@ pub async fn run_benchmark_compare(
     if args.iterations == 0 {
         anyhow::bail!("iterations must be > 0");
     }
+    if let Some(depth) = args.file_read_pipeline_depth
+        && depth == 0
+    {
+        anyhow::bail!("file_read_pipeline_depth must be > 0");
+    }
 
     let json_out = args.json_out.clone();
     let started_at = Utc::now();
@@ -767,10 +1035,11 @@ pub async fn run_benchmark_compare(
             no_disk: false,
             auto_lanes_report: None,
             lane_policy: None,
-            auto_runtime_report: None,
-            runtime_policy: None,
-            runtime_profile: None,
-            file_read_pipeline_depth: None,
+            auto_runtime_report: args.auto_runtime_report.clone(),
+            runtime_policy: args.runtime_policy.clone(),
+            runtime_policy_out: args.runtime_policy_out.clone(),
+            runtime_profile: args.runtime_profile,
+            file_read_pipeline_depth: args.file_read_pipeline_depth,
         };
         let disk_backed = run_benchmark_with_progress(http, server, disk_args, 0).await?;
         let host_after_disk = telemetry.sample();
@@ -787,10 +1056,11 @@ pub async fn run_benchmark_compare(
             no_disk: true,
             auto_lanes_report: None,
             lane_policy: None,
-            auto_runtime_report: None,
-            runtime_policy: None,
-            runtime_profile: None,
-            file_read_pipeline_depth: None,
+            auto_runtime_report: args.auto_runtime_report.clone(),
+            runtime_policy: args.runtime_policy.clone(),
+            runtime_policy_out: args.runtime_policy_out.clone(),
+            runtime_profile: args.runtime_profile,
+            file_read_pipeline_depth: args.file_read_pipeline_depth,
         };
         let no_disk = run_benchmark_with_progress(http, server, no_disk_args, 0).await?;
         let host_after_no_disk = telemetry.sample();
@@ -921,6 +1191,11 @@ pub async fn run_benchmark_compare_series(
             io_chunk_bytes: args.io_chunk_bytes,
             lanes: args.lanes,
             iterations: args.iterations,
+            auto_runtime_report: args.auto_runtime_report.clone(),
+            runtime_policy: args.runtime_policy.clone(),
+            runtime_policy_out: args.runtime_policy_out.clone(),
+            runtime_profile: args.runtime_profile,
+            file_read_pipeline_depth: args.file_read_pipeline_depth,
             cleanup_file: args.cleanup_files,
             json_out: None,
         };
@@ -1263,6 +1538,9 @@ pub async fn run_tune_runtime_profiles(
         let mut runtime_selection: Option<String> = None;
         let mut effective_io_chunk_bytes: Option<usize> = None;
         let mut file_read_pipeline_depth: Option<usize> = None;
+        let mut send_transform_pipeline_depth: Option<usize> = None;
+        let mut receive_write_pipeline_depth: Option<usize> = None;
+        let mut payload_codec: Option<String> = None;
 
         for iteration in 1..=args.iterations {
             let file_name = format!(
@@ -1286,6 +1564,7 @@ pub async fn run_tune_runtime_profiles(
                 lane_policy: None,
                 auto_runtime_report: None,
                 runtime_policy: None,
+                runtime_policy_out: None,
                 runtime_profile: Some(profile),
                 file_read_pipeline_depth: args.file_read_pipeline_depth,
             };
@@ -1296,6 +1575,9 @@ pub async fn run_tune_runtime_profiles(
                     runtime_selection = report.runtime_selection.clone();
                     effective_io_chunk_bytes = Some(report.effective_io_chunk_bytes);
                     file_read_pipeline_depth = Some(report.file_read_pipeline_depth);
+                    send_transform_pipeline_depth = Some(report.send_transform_pipeline_depth);
+                    receive_write_pipeline_depth = Some(report.receive_write_pipeline_depth);
+                    payload_codec = Some(report.payload_codec.clone());
                     runs.push(TuneRuntimeRun {
                         iteration,
                         transfer_id: Some(report.transfer_id),
@@ -1323,6 +1605,9 @@ pub async fn run_tune_runtime_profiles(
             runtime_profile: profile.as_str().to_owned(),
             effective_io_chunk_bytes,
             file_read_pipeline_depth,
+            send_transform_pipeline_depth,
+            receive_write_pipeline_depth,
+            payload_codec,
             runtime_selection,
             throughput_gbps: summarize_values(&throughput_values),
             successful_runs,
@@ -1540,6 +1825,29 @@ async fn persist_tune_runtime_policy(
     upsert_runtime_policy_entry(policy_path, entry).await
 }
 
+async fn persist_benchmark_runtime_policy(
+    policy_path: &Path,
+    selected_runtime_profile: Option<RuntimeProfile>,
+    workload_profile: &RuntimeWorkloadProfile,
+    report: &SendTransferReport,
+) -> Result<()> {
+    let runtime_profile = selected_runtime_profile.context(
+        "cannot persist runtime policy from benchmark: runtime profile is unspecified; pass --runtime-profile or provide --auto-runtime-report/--runtime-policy",
+    )?;
+    let throughput = report.average_gbps.max(0.0);
+    let entry = RuntimePolicyEntry {
+        profile: workload_profile.clone(),
+        recommended_profile: runtime_profile.as_str().to_owned(),
+        effective_io_chunk_bytes: report.effective_io_chunk_bytes,
+        file_read_pipeline_depth: report.file_read_pipeline_depth,
+        source: format!("transfer bench transfer_id={}", report.transfer_id),
+        tuned_at: Utc::now(),
+        throughput_p50_gbps: throughput,
+        throughput_p95_gbps: throughput,
+    };
+    upsert_runtime_policy_entry(policy_path, entry).await
+}
+
 fn parse_runtime_profile(value: &str) -> Option<RuntimeProfile> {
     match value.to_ascii_lowercase().as_str() {
         "balanced" => Some(RuntimeProfile::Balanced),
@@ -1547,6 +1855,26 @@ fn parse_runtime_profile(value: &str) -> Option<RuntimeProfile> {
         "low-cpu" => Some(RuntimeProfile::LowCpu),
         _ => None,
     }
+}
+
+async fn cpu_guardrail_triggered(threshold_percent: f64) -> bool {
+    if threshold_percent <= 0.0 {
+        return false;
+    }
+    let mut system = System::new_all();
+    let mut samples = Vec::new();
+    for idx in 0..4 {
+        system.refresh_cpu_usage();
+        if idx > 0 {
+            samples.push(system.global_cpu_usage() as f64);
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    if samples.is_empty() {
+        return false;
+    }
+    let average = samples.iter().sum::<f64>() / samples.len() as f64;
+    average >= threshold_percent
 }
 
 async fn resolve_benchmark_lanes(
@@ -1597,28 +1925,30 @@ async fn resolve_benchmark_lanes(
     }
 
     if let Some(policy_path) = lane_policy_path {
-        let policy = read_lane_policy(policy_path).await?;
-        if let Some(selection) = select_lane_policy(&policy, requested_profile) {
-            let lanes = selection.entry.recommended_lanes;
-            if lanes > 0 {
-                let selection_note = if selection.exact_profile_match {
-                    format!(
-                        "auto-selected lanes={} from lane policy {}",
-                        lanes,
-                        policy_path.display()
-                    )
-                } else {
-                    format!(
-                        "auto-selected lanes={} from lane policy {} fallback profile size_gib={} concurrency={} io_chunk_bytes={} no_disk={}",
-                        lanes,
-                        policy_path.display(),
-                        selection.entry.profile.size_gib,
-                        selection.entry.profile.concurrency,
-                        selection.entry.profile.io_chunk_bytes,
-                        selection.entry.profile.no_disk
-                    )
-                };
-                return Ok((lanes, Some(selection_note)));
+        if fs::try_exists(policy_path).await.unwrap_or(false) {
+            let policy = read_lane_policy(policy_path).await?;
+            if let Some(selection) = select_lane_policy(&policy, requested_profile) {
+                let lanes = selection.entry.recommended_lanes;
+                if lanes > 0 {
+                    let selection_note = if selection.exact_profile_match {
+                        format!(
+                            "auto-selected lanes={} from lane policy {}",
+                            lanes,
+                            policy_path.display()
+                        )
+                    } else {
+                        format!(
+                            "auto-selected lanes={} from lane policy {} fallback profile size_gib={} concurrency={} io_chunk_bytes={} no_disk={}",
+                            lanes,
+                            policy_path.display(),
+                            selection.entry.profile.size_gib,
+                            selection.entry.profile.concurrency,
+                            selection.entry.profile.io_chunk_bytes,
+                            selection.entry.profile.no_disk
+                        )
+                    };
+                    return Ok((lanes, Some(selection_note)));
+                }
             }
         }
     }
@@ -1631,10 +1961,14 @@ async fn resolve_benchmark_runtime_profile(
     auto_runtime_report: Option<&Path>,
     runtime_policy_path: Option<&Path>,
     requested_profile: &RuntimeWorkloadProfile,
+    cpu_guardrail_percent: f64,
 ) -> Result<(Option<RuntimeProfile>, Option<String>)> {
     if let Some(runtime_profile) = configured_runtime_profile {
         return Ok((Some(runtime_profile), None));
     }
+
+    let mut selected_profile: Option<RuntimeProfile> = None;
+    let mut selection_note: Option<String> = None;
 
     if let Some(report_path) = auto_runtime_report {
         let payload = fs::read(report_path).await.with_context(|| {
@@ -1679,43 +2013,69 @@ async fn resolve_benchmark_runtime_profile(
                     report.no_disk
                 )
             };
-            return Ok((Some(runtime_profile), Some(selection)));
+            selected_profile = Some(runtime_profile);
+            selection_note = Some(selection);
         }
     }
 
-    if let Some(policy_path) = runtime_policy_path {
-        let policy = read_runtime_policy(policy_path).await?;
-        if let Some(selection) = select_runtime_policy(&policy, requested_profile) {
-            let runtime_profile = parse_runtime_profile(&selection.entry.recommended_profile)
-                .with_context(|| {
-                    format!(
-                        "unsupported runtime profile '{}' in runtime policy {}",
-                        selection.entry.recommended_profile,
-                        policy_path.display()
+    if selected_profile.is_none() {
+        if let Some(policy_path) = runtime_policy_path {
+            if fs::try_exists(policy_path).await.unwrap_or(false) {
+                let policy = read_runtime_policy(policy_path).await?;
+                if let Some(selection) = select_runtime_policy(&policy, requested_profile) {
+                    let runtime_profile = parse_runtime_profile(
+                        &selection.entry.recommended_profile,
                     )
-                })?;
-            let selection_note = if selection.exact_profile_match {
-                format!(
-                    "auto-selected runtime-profile={} from runtime policy {}",
-                    runtime_profile.as_str(),
-                    policy_path.display()
-                )
-            } else {
-                format!(
-                    "auto-selected runtime-profile={} from runtime policy {} fallback profile size_gib={} lanes={} io_chunk_bytes={} no_disk={}",
-                    runtime_profile.as_str(),
-                    policy_path.display(),
-                    selection.entry.profile.size_gib,
-                    selection.entry.profile.lanes,
-                    selection.entry.profile.io_chunk_bytes,
-                    selection.entry.profile.no_disk
-                )
-            };
-            return Ok((Some(runtime_profile), Some(selection_note)));
+                    .with_context(|| {
+                        format!(
+                            "unsupported runtime profile '{}' in runtime policy {}",
+                            selection.entry.recommended_profile,
+                            policy_path.display()
+                        )
+                    })?;
+                    let note = if selection.exact_profile_match {
+                        format!(
+                            "auto-selected runtime-profile={} from runtime policy {}",
+                            runtime_profile.as_str(),
+                            policy_path.display()
+                        )
+                    } else {
+                        format!(
+                            "auto-selected runtime-profile={} from runtime policy {} fallback profile size_gib={} lanes={} io_chunk_bytes={} no_disk={}",
+                            runtime_profile.as_str(),
+                            policy_path.display(),
+                            selection.entry.profile.size_gib,
+                            selection.entry.profile.lanes,
+                            selection.entry.profile.io_chunk_bytes,
+                            selection.entry.profile.no_disk
+                        )
+                    };
+                    selected_profile = Some(runtime_profile);
+                    selection_note = Some(note);
+                }
+            }
         }
     }
 
-    Ok((None, None))
+    if selected_profile.is_none() {
+        selected_profile = Some(RuntimeProfile::Throughput);
+        selection_note =
+            Some("defaulted runtime-profile=throughput (WAN throughput-first baseline)".to_owned());
+    }
+
+    if cpu_guardrail_triggered(cpu_guardrail_percent).await {
+        let guard_note = format!(
+            "cpu guardrail triggered (>= {:.1}% sustained), forcing runtime-profile=low-cpu",
+            cpu_guardrail_percent
+        );
+        selected_profile = Some(RuntimeProfile::LowCpu);
+        selection_note = Some(match selection_note {
+            Some(existing) => format!("{existing}; {guard_note}"),
+            None => guard_note,
+        });
+    }
+
+    Ok((selected_profile, selection_note))
 }
 
 async fn run_benchmark_with_progress(
@@ -1724,6 +2084,21 @@ async fn run_benchmark_with_progress(
     args: BenchArgs,
     progress_interval_secs: u64,
 ) -> Result<SendTransferReport> {
+    let defaults = load_client_defaults();
+    let lane_policy_path = args
+        .lane_policy
+        .as_deref()
+        .or(Some(defaults.lane_policy_path.as_path()));
+    let runtime_policy_path = args
+        .runtime_policy
+        .as_deref()
+        .or(Some(defaults.runtime_policy_path.as_path()));
+    let runtime_policy_out_path = args.runtime_policy_out.clone().or_else(|| {
+        defaults
+            .auto_policy_update
+            .then(|| defaults.runtime_policy_path.clone())
+    });
+
     let workload_profile = WorkloadProfile {
         size_gib: args.size_gib,
         concurrency: 1,
@@ -1733,7 +2108,7 @@ async fn run_benchmark_with_progress(
     let (selected_lanes, lane_selection) = resolve_benchmark_lanes(
         args.lanes,
         args.auto_lanes_report.as_deref(),
-        args.lane_policy.as_deref(),
+        lane_policy_path,
         &workload_profile,
     )
     .await?;
@@ -1746,8 +2121,9 @@ async fn run_benchmark_with_progress(
     let (selected_runtime_profile, runtime_profile_selection) = resolve_benchmark_runtime_profile(
         args.runtime_profile,
         args.auto_runtime_report.as_deref(),
-        args.runtime_policy.as_deref(),
+        runtime_policy_path,
         &runtime_workload_profile,
+        defaults.cpu_guardrail_percent,
     )
     .await?;
 
@@ -1793,7 +2169,7 @@ async fn run_benchmark_with_progress(
     } else {
         PayloadSource::File(args.file_path.clone())
     };
-    send_transfer_with_source(
+    let report = send_transfer_with_source(
         http,
         server,
         created.transfer_id,
@@ -1807,7 +2183,19 @@ async fn run_benchmark_with_progress(
         args.file_read_pipeline_depth,
         runtime_profile_selection,
     )
-    .await
+    .await?;
+
+    if let Some(policy_path) = runtime_policy_out_path.as_deref() {
+        persist_benchmark_runtime_policy(
+            policy_path,
+            selected_runtime_profile,
+            &runtime_workload_profile,
+            &report,
+        )
+        .await?;
+    }
+
+    Ok(report)
 }
 
 pub async fn send_transfer(
@@ -1815,36 +2203,137 @@ pub async fn send_transfer(
     server: &str,
     args: SendArgs,
 ) -> Result<SendTransferReport> {
-    let transfer = fetch_transfer_status(http, server, args.transfer_id).await?;
+    if let Some(depth) = args.file_read_pipeline_depth
+        && depth == 0
+    {
+        anyhow::bail!("file_read_pipeline_depth must be > 0");
+    }
+    let defaults = load_client_defaults();
+    let lane_policy_path = args
+        .lane_policy
+        .as_deref()
+        .or(Some(defaults.lane_policy_path.as_path()));
+    let runtime_policy_path = args
+        .runtime_policy
+        .as_deref()
+        .or(Some(defaults.runtime_policy_path.as_path()));
+    let runtime_policy_out_path = args.runtime_policy_out.clone().or_else(|| {
+        defaults
+            .auto_policy_update
+            .then(|| defaults.runtime_policy_path.clone())
+    });
+
+    let file_metadata = fs::metadata(&args.file_path)
+        .await
+        .with_context(|| format!("failed reading file metadata {}", args.file_path.display()))?;
+    let file_name = args
+        .file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("metra-upload.bin")
+        .to_owned();
+    let local_file_size = file_metadata.len();
+
+    let existing_transfer = if let Some(transfer_id) = args.transfer_id {
+        Some(fetch_transfer_status(http, server, transfer_id).await?)
+    } else {
+        None
+    };
+    let expected_file_size = existing_transfer
+        .as_ref()
+        .map(|transfer| transfer.file_size_bytes)
+        .unwrap_or(local_file_size);
+
+    let requested_lanes = args.lanes;
+    let workload_profile = WorkloadProfile {
+        size_gib: size_gib_from_bytes_ceil(expected_file_size),
+        concurrency: 1,
+        io_chunk_bytes: args.io_chunk_bytes,
+        no_disk: false,
+    };
+    let (selected_lanes, lane_selection) = resolve_benchmark_lanes(
+        requested_lanes,
+        args.auto_lanes_report.as_deref(),
+        lane_policy_path,
+        &workload_profile,
+    )
+    .await?;
+
     let runtime_workload_profile = RuntimeWorkloadProfile {
-        size_gib: size_gib_from_bytes_ceil(transfer.file_size_bytes),
-        lanes: args.lanes,
+        size_gib: size_gib_from_bytes_ceil(expected_file_size),
+        lanes: selected_lanes,
         io_chunk_bytes: args.io_chunk_bytes,
         no_disk: false,
     };
     let (selected_runtime_profile, runtime_profile_selection) = resolve_benchmark_runtime_profile(
         args.runtime_profile,
         args.auto_runtime_report.as_deref(),
-        args.runtime_policy.as_deref(),
+        runtime_policy_path,
         &runtime_workload_profile,
+        defaults.cpu_guardrail_percent,
     )
     .await?;
 
-    send_transfer_with_source(
+    let transfer_id = if let Some(existing) = existing_transfer {
+        existing.transfer_id
+    } else {
+        let destination_uri =
+            resolve_destination_uri(args.destination.as_deref(), &file_name, &defaults)?;
+        let create = CreateTransferRequest {
+            tenant_id: args
+                .tenant_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(defaults.tenant_id.as_str())
+                .to_owned(),
+            user_id: args
+                .user_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(defaults.user_id.as_str())
+                .to_owned(),
+            source_uri: format!("file://{}", args.file_path.display()),
+            destination_uri,
+            file_name,
+            file_size_bytes: local_file_size,
+            resume_chunk_size_bytes: RESUME_CHUNK_SIZE_BYTES,
+            overwrite: args.overwrite,
+            immutable_destination: args.immutable_destination,
+        };
+        create
+            .validate()
+            .map_err(|err| anyhow::anyhow!("invalid send transfer request: {err}"))?;
+        let created = create_transfer(http, server, &create).await?;
+        created.transfer_id
+    };
+
+    let report = send_transfer_with_source(
         http,
         server,
-        args.transfer_id,
-        PayloadSource::File(args.file_path),
+        transfer_id,
+        PayloadSource::File(args.file_path.clone()),
         args.quic_addr,
         args.io_chunk_bytes,
         args.progress_interval_secs,
-        args.lanes,
-        None,
+        selected_lanes,
+        lane_selection,
         selected_runtime_profile,
         args.file_read_pipeline_depth,
         runtime_profile_selection,
     )
-    .await
+    .await?;
+
+    if let Some(policy_path) = runtime_policy_out_path.as_deref() {
+        persist_benchmark_runtime_policy(
+            policy_path,
+            selected_runtime_profile,
+            &runtime_workload_profile,
+            &report,
+        )
+        .await?;
+    }
+
+    Ok(report)
 }
 
 async fn send_transfer_with_source(
@@ -1921,8 +2410,11 @@ async fn send_transfer_with_source(
             file_name: transfer.file_name.clone(),
             resume_chunk_size_bytes: transfer.resume_chunk_size_bytes,
             source: source.clone(),
+            payload_codec: runtime_tuning.payload_codec,
             io_chunk_bytes: runtime_tuning.effective_io_chunk_bytes,
             file_read_pipeline_depth: runtime_tuning.file_read_pipeline_depth,
+            send_transform_pipeline_depth: runtime_tuning.send_transform_pipeline_depth,
+            receive_write_pipeline_depth: runtime_tuning.receive_write_pipeline_depth,
             lane_index: lane_index as u32,
             total_lanes: lanes,
             range_start,
@@ -1985,11 +2477,14 @@ async fn send_transfer_with_source(
         file_path: source.label(),
         file_size_bytes: transfer.file_size_bytes,
         effective_lanes: lanes,
+        payload_codec: runtime_tuning.payload_codec.as_wire().to_owned(),
         runtime_profile: runtime_tuning
             .runtime_profile
             .map(|profile| profile.as_str().to_owned()),
         effective_io_chunk_bytes: runtime_tuning.effective_io_chunk_bytes,
         file_read_pipeline_depth: runtime_tuning.file_read_pipeline_depth,
+        send_transform_pipeline_depth: runtime_tuning.send_transform_pipeline_depth,
+        receive_write_pipeline_depth: runtime_tuning.receive_write_pipeline_depth,
         runtime_selection,
         lane_selection,
         resumed_from_bytes,
@@ -2021,6 +2516,8 @@ async fn send_lane(
         total_lanes: lane.total_lanes,
         range_start: lane.range_start,
         range_end_exclusive: lane.range_end_exclusive,
+        payload_codec: lane.payload_codec.as_wire().to_owned(),
+        receive_write_pipeline_depth: lane.receive_write_pipeline_depth,
     };
     write_json_frame(&mut send_stream, &open).await?;
     let open_ack = read_json_frame::<QuicTransferOpenAck>(&mut recv_stream).await?;
@@ -2042,16 +2539,32 @@ async fn send_lane(
             lane.range_end_exclusive
         );
     }
+    let acknowledged_codec = PayloadCodec::from_wire(&open_ack.payload_codec).ok_or_else(|| {
+        anyhow::anyhow!(
+            "server returned unsupported payload codec '{}'",
+            open_ack.payload_codec
+        )
+    })?;
+    if acknowledged_codec != lane.payload_codec {
+        anyhow::bail!(
+            "server payload codec mismatch: requested={} acknowledged={}",
+            lane.payload_codec.as_wire(),
+            acknowledged_codec.as_wire()
+        );
+    }
 
     let bytes_streamed = match &lane.source {
         PayloadSource::File(file_path) => {
             send_file_lane_pipelined(
                 &mut send_stream,
+                lane.transfer_id,
                 file_path,
                 open_ack.resume_offset_bytes,
                 lane.range_end_exclusive,
+                lane.payload_codec,
                 lane.io_chunk_bytes,
                 lane.file_read_pipeline_depth,
+                lane.send_transform_pipeline_depth,
                 lane.lane_index,
                 progress_bytes.clone(),
             )
@@ -2060,9 +2573,12 @@ async fn send_lane(
         PayloadSource::GeneratedZeros { .. } => {
             send_generated_lane(
                 &mut send_stream,
+                lane.transfer_id,
                 open_ack.resume_offset_bytes,
                 lane.range_end_exclusive,
+                lane.payload_codec,
                 lane.io_chunk_bytes,
+                lane.lane_index,
                 progress_bytes.clone(),
             )
             .await?
@@ -2080,11 +2596,14 @@ async fn send_lane(
 
 async fn send_file_lane_pipelined(
     send_stream: &mut quinn::SendStream,
+    transfer_id: Uuid,
     file_path: &Path,
     resume_offset: u64,
     range_end_exclusive: u64,
+    payload_codec: PayloadCodec,
     io_chunk_bytes: usize,
     file_read_pipeline_depth: usize,
+    send_transform_pipeline_depth: usize,
     lane_index: u32,
     progress_bytes: Arc<AtomicU64>,
 ) -> Result<u64> {
@@ -2094,14 +2613,29 @@ async fn send_file_lane_pipelined(
     }
 
     #[derive(Debug)]
-    struct SendPipelineChunk {
+    struct SendReadChunk {
         buffer: Vec<u8>,
         bytes_read: usize,
     }
 
-    fn encrypt_payload_chunk_in_place(_payload: &mut [u8]) {
-        // QUIC already encrypts stream payload; keep a dedicated stage so app-level
-        // crypto/FEC transforms can be inserted without reshaping backpressure flow.
+    #[derive(Debug)]
+    struct SendWireChunk {
+        wire_payload: Vec<u8>,
+        plaintext_len: usize,
+        recycle_buffer: Vec<u8>,
+    }
+
+    fn random_nonce_prefix() -> [u8; 4] {
+        let binding = Uuid::new_v4();
+        let bytes = binding.as_bytes();
+        [bytes[0], bytes[1], bytes[2], bytes[3]]
+    }
+
+    fn payload_nonce(prefix: [u8; 4], counter: u64) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&prefix);
+        nonce[4..12].copy_from_slice(&counter.to_be_bytes());
+        nonce
     }
 
     let (buffer_pool_tx, mut buffer_pool_rx) = mpsc::channel::<Vec<u8>>(file_read_pipeline_depth);
@@ -2112,8 +2646,9 @@ async fn send_file_lane_pipelined(
             .map_err(|_| anyhow::anyhow!("failed seeding file read pipeline buffers"))?;
     }
 
-    let (read_tx, mut read_rx) = mpsc::channel::<SendPipelineChunk>(file_read_pipeline_depth);
-    let (encrypt_tx, mut encrypt_rx) = mpsc::channel::<SendPipelineChunk>(file_read_pipeline_depth);
+    let (read_tx, mut read_rx) = mpsc::channel::<SendReadChunk>(file_read_pipeline_depth);
+    let (encrypt_tx, mut encrypt_rx) =
+        mpsc::channel::<SendWireChunk>(send_transform_pipeline_depth.max(1));
     let file_path = file_path.to_path_buf();
     let reader_task = tokio::spawn(async move {
         let mut file = fs::File::open(&file_path)
@@ -2142,7 +2677,7 @@ async fn send_file_lane_pipelined(
                 );
             }
             read_tx
-                .send(SendPipelineChunk { buffer, bytes_read })
+                .send(SendReadChunk { buffer, bytes_read })
                 .await
                 .map_err(|_| anyhow::anyhow!("file read stage channel unexpectedly closed"))?;
             remaining -= bytes_read as u64;
@@ -2151,10 +2686,29 @@ async fn send_file_lane_pipelined(
     });
 
     let encrypt_task = tokio::spawn(async move {
-        while let Some(mut chunk) = read_rx.recv().await {
-            encrypt_payload_chunk_in_place(&mut chunk.buffer[..chunk.bytes_read]);
+        let aead_codec = match payload_codec {
+            PayloadCodec::RawV1 => None,
+            PayloadCodec::AeadV1 => Some(AeadLaneCodec::new(transfer_id, lane_index)),
+        };
+        let nonce_prefix = random_nonce_prefix();
+        let mut frame_counter = 0u64;
+
+        while let Some(chunk) = read_rx.recv().await {
+            let nonce = payload_nonce(nonce_prefix, frame_counter);
+            frame_counter = frame_counter.saturating_add(1);
+            let wire_payload = encode_payload_frame(
+                payload_codec,
+                &chunk.buffer[..chunk.bytes_read],
+                nonce,
+                aead_codec.as_ref(),
+            )
+            .map_err(|msg| anyhow::anyhow!(msg))?;
             encrypt_tx
-                .send(chunk)
+                .send(SendWireChunk {
+                    wire_payload,
+                    plaintext_len: chunk.bytes_read,
+                    recycle_buffer: chunk.buffer,
+                })
                 .await
                 .map_err(|_| anyhow::anyhow!("file encrypt stage channel unexpectedly closed"))?;
         }
@@ -2171,14 +2725,14 @@ async fn send_file_lane_pipelined(
                 .await
                 .context("file read pipeline ended before lane completion")?;
             send_stream
-                .write_all(&chunk.buffer[..chunk.bytes_read])
+                .write_all(&chunk.wire_payload)
                 .await
                 .context("failed writing stream payload")?;
-            let written = chunk.bytes_read as u64;
+            let written = chunk.plaintext_len as u64;
             remaining = remaining.saturating_sub(written);
             bytes_streamed += written;
             progress_bytes.fetch_add(written, Ordering::Relaxed);
-            let _ = buffer_pool_tx.send(chunk.buffer).await;
+            let _ = buffer_pool_tx.send(chunk.recycle_buffer).await;
         }
 
         if bytes_streamed != total_bytes {
@@ -2217,19 +2771,50 @@ async fn send_file_lane_pipelined(
 
 async fn send_generated_lane(
     send_stream: &mut quinn::SendStream,
+    transfer_id: Uuid,
     resume_offset: u64,
     range_end_exclusive: u64,
+    payload_codec: PayloadCodec,
     io_chunk_bytes: usize,
+    lane_index: u32,
     progress_bytes: Arc<AtomicU64>,
 ) -> Result<u64> {
+    fn random_nonce_prefix() -> [u8; 4] {
+        let binding = Uuid::new_v4();
+        let bytes = binding.as_bytes();
+        [bytes[0], bytes[1], bytes[2], bytes[3]]
+    }
+
+    fn payload_nonce(prefix: [u8; 4], counter: u64) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&prefix);
+        nonce[4..12].copy_from_slice(&counter.to_be_bytes());
+        nonce
+    }
+
+    let aead_codec = match payload_codec {
+        PayloadCodec::RawV1 => None,
+        PayloadCodec::AeadV1 => Some(AeadLaneCodec::new(transfer_id, lane_index)),
+    };
+    let nonce_prefix = random_nonce_prefix();
+    let mut frame_counter = 0u64;
     let buffer = vec![0u8; io_chunk_bytes];
     let mut remaining = range_end_exclusive - resume_offset;
     let mut bytes_streamed = 0u64;
 
     while remaining > 0 {
         let to_send = remaining.min(buffer.len() as u64) as usize;
+        let nonce = payload_nonce(nonce_prefix, frame_counter);
+        frame_counter = frame_counter.saturating_add(1);
+        let frame = encode_payload_frame(
+            payload_codec,
+            &buffer[..to_send],
+            nonce,
+            aead_codec.as_ref(),
+        )
+        .map_err(|msg| anyhow::anyhow!(msg))?;
         send_stream
-            .write_all(&buffer[..to_send])
+            .write_all(&frame)
             .await
             .context("failed writing generated payload")?;
         let written = to_send as u64;
@@ -2481,8 +3066,11 @@ mod tests {
             None,
         )
         .expect("runtime tuning should resolve");
-        assert_eq!(tuning.effective_io_chunk_bytes, 16 * 1024 * 1024);
-        assert_eq!(tuning.file_read_pipeline_depth, 8);
+        assert_eq!(tuning.payload_codec, PayloadCodec::AeadV1);
+        assert_eq!(tuning.effective_io_chunk_bytes, 32 * 1024 * 1024);
+        assert_eq!(tuning.file_read_pipeline_depth, 10);
+        assert_eq!(tuning.send_transform_pipeline_depth, 12);
+        assert_eq!(tuning.receive_write_pipeline_depth, 8);
     }
 
     #[test]
@@ -2490,8 +3078,23 @@ mod tests {
         let tuning =
             resolve_runtime_tuning(Some(RuntimeProfile::Throughput), 32 * 1024 * 1024, Some(6))
                 .expect("runtime tuning should resolve");
+        assert_eq!(tuning.payload_codec, PayloadCodec::AeadV1);
         assert_eq!(tuning.effective_io_chunk_bytes, 32 * 1024 * 1024);
         assert_eq!(tuning.file_read_pipeline_depth, 6);
+        assert_eq!(tuning.send_transform_pipeline_depth, 6);
+        assert_eq!(tuning.receive_write_pipeline_depth, 6);
+    }
+
+    #[test]
+    fn low_cpu_profile_prefers_raw_codec_and_small_pipelines() {
+        let tuning =
+            resolve_runtime_tuning(Some(RuntimeProfile::LowCpu), DEFAULT_IO_CHUNK_BYTES, None)
+                .expect("runtime tuning should resolve");
+        assert_eq!(tuning.payload_codec, PayloadCodec::RawV1);
+        assert_eq!(tuning.effective_io_chunk_bytes, 4 * 1024 * 1024);
+        assert_eq!(tuning.file_read_pipeline_depth, 2);
+        assert_eq!(tuning.send_transform_pipeline_depth, 2);
+        assert_eq!(tuning.receive_write_pipeline_depth, 2);
     }
 
     fn stats(p50: f64, p95: f64) -> ThroughputStats {

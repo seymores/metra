@@ -19,6 +19,10 @@ Open-source (Apache-2.0) large-file transfer platform designed to rival Aspera u
   - client sends QUIC transfer-open control frame
   - server replies with resume offset based on staged bytes
   - client streams remaining bytes only
+- App payload framing/transform path (bounded pipeline stages):
+  - sender pipeline: `read -> app-frame/AEAD -> QUIC stream write`
+  - receiver pipeline: `QUIC stream read -> app-frame decrypt -> file write`
+  - runtime profiles tune chunk/depth/codec (`balanced`, `throughput`, `low-cpu`)
 
 ## Architecture Direction
 
@@ -107,12 +111,44 @@ cargo run --release -p metra-client -- transfer create \
 
 ### 6) Send File Data over QUIC
 
+Minimal send uses two required inputs: local file path and destination account/URI.
+
 ```bash
 cargo run --release -p metra-client -- --output json transfer send \
-  --transfer-id <UUID_FROM_CREATE> \
-  --file-path /tmp/input.bin \
-  --io-chunk-bytes 16777216 \
-  --auto-runtime-report /tmp/metra-reports/tune-runtime-1g-l2.json
+  /tmp/input.bin \
+  home
+```
+
+You can also pass a full destination URI directly:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer send \
+  /tmp/input.bin \
+  local://uploads/
+```
+
+`send` defaults:
+- runtime profile: `throughput` (with CPU guardrail fallback to `low-cpu` at `80%`)
+- lanes: `2` (unless overridden or auto-selected by report/policy)
+- policy paths: `~/.metra/runtime-policy.json` and `~/.metra/lane-policy.json`
+
+Config lookup order for defaults (lowest to highest priority):
+- `~/.metrarc`
+- `~/.metra/.metrarc`
+- `./.metrarc`
+- env vars (`METRA_*`)
+- explicit CLI flags
+
+Example `.metrarc`:
+
+```ini
+tenant_id=default-tenant
+user_id=default-user
+cpu_guardrail_percent=80
+auto_policy_update=true
+runtime_policy_path=/Users/you/.metra/runtime-policy.json
+lane_policy_path=/Users/you/.metra/lane-policy.json
+destination.home=local://uploads/
 ```
 
 ### 7) Query Transfer Status
@@ -173,16 +209,20 @@ cargo run --release -p metra-client -- --output json transfer tune-runtime \
   --runtime-policy-out /tmp/metra-reports/runtime-policy.json
 ```
 
-`transfer send`, `transfer bench`, and `transfer matrix` also accept:
+`transfer send`, `transfer bench`, `transfer matrix`, `transfer compare`, and `transfer compare-series` also accept:
 - `--runtime-profile balanced|throughput|low-cpu`
 - `--file-read-pipeline-depth <N>`
 - `--auto-runtime-report <PATH_TO_TUNE_RUNTIME_REPORT_JSON>`
 - `--runtime-policy <PATH_TO_RUNTIME_POLICY_JSON>`
 
+`transfer bench`, `transfer compare`, and `transfer compare-series` also accept:
+- `--runtime-policy-out <PATH_TO_RUNTIME_POLICY_JSON>`
+
 Runtime selection precedence:
 - explicit `--runtime-profile`
 - `--auto-runtime-report`
 - `--runtime-policy`
+- default `throughput`, then CPU guardrail fallback to `low-cpu`
 
 Use a tune-runtime report to auto-select runtime profile for matching benchmark workloads:
 
@@ -209,7 +249,29 @@ cargo run --release -p metra-client -- --output json transfer bench \
 ```
 
 Auto runtime-profile selection from reports/policy is available for `transfer send`,
-`transfer bench`, `transfer matrix`, and TUI benchmark runs.
+`transfer bench`, `transfer matrix`, `transfer compare`, `transfer compare-series`,
+and TUI benchmark runs.
+
+Persist and apply runtime policy from benchmark runs:
+
+```bash
+cargo run --release -p metra-client -- --output json transfer bench \
+  --size-gib 1 \
+  --file-path /tmp/metra-lowcpu-bootstrap.bin \
+  --io-chunk-bytes 8388608 \
+  --lanes 2 \
+  --no-disk \
+  --runtime-profile low-cpu \
+  --runtime-policy-out /tmp/metra-reports/runtime-policy.json
+
+cargo run --release -p metra-client -- --output json transfer bench \
+  --size-gib 1 \
+  --file-path /tmp/metra-lowcpu-applied.bin \
+  --io-chunk-bytes 8388608 \
+  --lanes 2 \
+  --no-disk \
+  --runtime-policy /tmp/metra-reports/runtime-policy.json
+```
 
 Run a no-disk benchmark (client generates payload, server uses null sink) to isolate transfer-path overhead from filesystem I/O:
 
@@ -347,7 +409,8 @@ sudo ./scripts/netem.sh clear lo
 ## Resume Validation
 
 1) Start a large send and interrupt it (`Ctrl+C`).
-2) Re-run the same `transfer send` command with the same `transfer_id`.
+2) Re-run with `--transfer-id` and the same local file:
+   `transfer send --transfer-id <UUID> /path/to/file.bin`.
 3) Confirm `resumed_from_bytes` in output is non-zero.
 
 ## Measured Local Baseline (This Machine)
@@ -411,6 +474,7 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 
 - Workflow: `.github/workflows/benchmark-gate.yml`
 - Baseline config: `ci/benchmark-baseline.json`
+- Disk baseline config: `ci/benchmark-disk-baseline.json`
 - Gate script: `scripts/ci/benchmark_gate.py`
 - Lane baseline config: `ci/lane-baseline.json`
 - Lane gate script: `scripts/ci/lane_gate.py`
@@ -420,6 +484,8 @@ Server-side QUIC data path now records OpenTelemetry metrics for:
 
 The gate runs `transfer tune-runtime` against localhost (`--no-disk`) and fails CI if any
 runtime profile p50/p95 throughput or completion-rate regresses below baseline threshold.
+It also runs a disk-backed `transfer tune-runtime` pass and applies disk-path p50/p95/completion
+regression gates.
 It also runs `transfer tune-lanes` and fails CI if lane throughput/success/stability regresses
 below lane baseline thresholds.
 It also runs WAN realism matrix jobs under netem `latency`, `loss`, and `jitter` profiles and
@@ -468,6 +534,9 @@ Each WAN scenario job uploads artifacts:
 - [x] Add adaptive lane policy that auto-selects from recent tune-lanes reports.
 - [x] Add lane-policy persistence by workload profile (size/concurrency) and automatic fallback.
 - [x] Add server QUIC transport profiles (`--quic-profile lan|wan|high-bdp`).
+- [x] Add bounded staged pipelines (`read -> transform -> send`, `receive -> transform -> write`).
+- [x] Add app-level payload framing with AEAD codec support and profile-based codec selection.
+- [x] Add disk-path runtime regression gate in CI.
 - [x] Add runtime profile presets and profile-sweep benchmark (`transfer tune-runtime`).
 - [x] Add runtime-policy persistence by workload profile (`--runtime-policy-out`) and automatic fallback (`--runtime-policy`).
 - [x] Add auto runtime-profile selection from tune-runtime reports (`--auto-runtime-report`).

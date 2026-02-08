@@ -8,8 +8,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use metra_proto::{
-    QUIC_PROTOCOL_VERSION, QuicTransferCompleteAck, QuicTransferOpen, QuicTransferOpenAck,
-    TransferStatus,
+    APP_PAYLOAD_FRAME_HEADER_BYTES, AeadLaneCodec, PayloadCodec, QUIC_PROTOCOL_VERSION,
+    QuicTransferCompleteAck, QuicTransferOpen, QuicTransferOpenAck, RESUME_CHUNK_SIZE_BYTES,
+    TRANSFER_LANES_MAX, TransferStatus, TransferSummary, app_payload_wire_len,
+    decode_payload_frame, decode_payload_frame_header, is_valid_storage_id_segment,
+    normalize_receive_write_pipeline_depth,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use serde::{Deserialize, Serialize};
@@ -29,9 +32,9 @@ use crate::{
     wire::{read_json_frame, write_json_frame},
 };
 
-const PROGRESS_UPDATE_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_CHUNK_READ_BYTES: usize = 8 * 1024 * 1024;
-const RECEIVE_WRITE_PIPELINE_DEPTH: usize = 4;
+const PROGRESS_UPDATE_INTERVAL_BYTES: u64 = RESUME_CHUNK_SIZE_BYTES;
+const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
+const MAX_CONCURRENT_UNI_STREAMS: u32 = 32;
 
 fn is_null_sink_uri(uri: &str) -> bool {
     uri.starts_with("null://") || uri.starts_with("memory://") || uri.starts_with("mem://")
@@ -95,6 +98,36 @@ impl Drop for LaneStreamMetricGuard {
                 self.started_at.elapsed(),
             );
         }
+    }
+}
+
+struct LaneWriterLeaseGuard {
+    state: AppState,
+    transfer_id: Uuid,
+    lane_index: u32,
+}
+
+impl LaneWriterLeaseGuard {
+    fn acquire(state: &AppState, transfer_id: Uuid, lane_index: u32) -> Result<Self> {
+        if !state.try_acquire_lane_writer(transfer_id, lane_index) {
+            bail!(
+                "lane {} for transfer {} already has an active writer",
+                lane_index,
+                transfer_id
+            );
+        }
+        Ok(Self {
+            state: state.clone(),
+            transfer_id,
+            lane_index,
+        })
+    }
+}
+
+impl Drop for LaneWriterLeaseGuard {
+    fn drop(&mut self) {
+        self.state
+            .release_lane_writer(self.transfer_id, self.lane_index);
     }
 }
 
@@ -249,8 +282,8 @@ fn apply_transport_profile(
     transport_config: &mut quinn::TransportConfig,
     profile: QuicTransportProfile,
 ) -> Result<()> {
-    transport_config.max_concurrent_bidi_streams(4_096u32.into());
-    transport_config.max_concurrent_uni_streams(1_024u32.into());
+    transport_config.max_concurrent_bidi_streams(MAX_CONCURRENT_BIDI_STREAMS.into());
+    transport_config.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
     match profile {
         QuicTransportProfile::Lan => {
             transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
@@ -308,6 +341,13 @@ async fn handle_quic_stream(
     let open = read_json_frame::<QuicTransferOpen>(&mut recv_stream).await?;
 
     let total_lanes = open.total_lanes.max(1);
+    if total_lanes > TRANSFER_LANES_MAX {
+        bail!(
+            "total_lanes {} exceeds max {}",
+            total_lanes,
+            TRANSFER_LANES_MAX
+        );
+    }
     if open.lane_index >= total_lanes {
         bail!("invalid lane index {} of {}", open.lane_index, total_lanes);
     }
@@ -328,6 +368,16 @@ async fn handle_quic_stream(
     }
     let striped =
         total_lanes > 1 || range_start != 0 || range_end_exclusive != open.file_size_bytes;
+    let payload_codec = PayloadCodec::from_wire(&open.payload_codec).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported payload codec '{}' for transfer {} lane {}",
+            open.payload_codec,
+            open.transfer_id,
+            open.lane_index
+        )
+    })?;
+    let receive_write_pipeline_depth =
+        normalize_receive_write_pipeline_depth(open.receive_write_pipeline_depth);
 
     let (
         transfer_id,
@@ -370,6 +420,13 @@ async fn handle_quic_stream(
             transfer.bytes_transferred,
         )
     };
+    if !is_valid_storage_id_segment(&tenant_id) {
+        bail!("transfer has invalid tenant_id '{}'", tenant_id);
+    }
+    if !is_valid_storage_id_segment(&user_id) {
+        bail!("transfer has invalid user_id '{}'", user_id);
+    }
+    let _lane_writer_lease = LaneWriterLeaseGuard::acquire(&state, transfer_id, open.lane_index)?;
 
     let tenant_dir = state.data_dir.join(&tenant_id).join(&user_id);
     fs::create_dir_all(&tenant_dir)
@@ -427,150 +484,179 @@ async fn handle_quic_stream(
         transfer.status = TransferStatus::Running;
         transfer.updated_at = Utc::now();
     }
+    persist_transfer_summary(&state, open.transfer_id).await?;
     mark_transfer_started_if_absent(&state, open.transfer_id).await;
 
-    if striped && !discard_payload {
-        let staging_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&staging_path)
-            .await
-            .with_context(|| format!("failed opening staging file {}", staging_path.display()))?;
-        staging_file
-            .set_len(open.file_size_bytes)
-            .await
-            .context("failed pre-sizing striped staging file")?;
-    }
+    let stream_result: Result<()> = async {
+        if striped && !discard_payload {
+            let staging_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&staging_path)
+                .await
+                .with_context(|| {
+                    format!("failed opening staging file {}", staging_path.display())
+                })?;
+            staging_file
+                .set_len(open.file_size_bytes)
+                .await
+                .context("failed pre-sizing striped staging file")?;
+        }
 
-    let open_ack = QuicTransferOpenAck {
-        ok: true,
-        resume_offset_bytes: resume_offset,
-        message: "transfer stream accepted".to_owned(),
-    };
-    write_json_frame(&mut send_stream, &open_ack).await?;
-    info!(
-        peer = %peer,
-        transfer_id = %open.transfer_id,
-        lane = open.lane_index,
-        total_lanes = total_lanes,
-        range_start = range_start,
-        range_end = range_end_exclusive,
-        resume_offset = resume_offset,
-        "accepted upload stream"
-    );
-    let mut lane_metrics =
-        LaneStreamMetricGuard::new(open.lane_index, total_lanes, striped, discard_payload);
+        let open_ack = QuicTransferOpenAck {
+            ok: true,
+            resume_offset_bytes: resume_offset,
+            message: "transfer stream accepted".to_owned(),
+            payload_codec: payload_codec.as_wire().to_owned(),
+            receive_write_pipeline_depth,
+        };
+        write_json_frame(&mut send_stream, &open_ack).await?;
+        info!(
+            peer = %peer,
+            transfer_id = %open.transfer_id,
+            lane = open.lane_index,
+            total_lanes = total_lanes,
+            range_start = range_start,
+            range_end = range_end_exclusive,
+            resume_offset = resume_offset,
+            payload_codec = payload_codec.as_wire(),
+            receive_write_pipeline_depth = receive_write_pipeline_depth,
+            "accepted upload stream"
+        );
+        let mut lane_metrics =
+            LaneStreamMetricGuard::new(open.lane_index, total_lanes, striped, discard_payload);
 
-    let expected_bytes = range_end_exclusive - resume_offset;
-    let stream_bytes_written = if discard_payload {
-        receive_lane_payload_no_disk(
-            &mut recv_stream,
-            expected_bytes,
-            open.transfer_id,
-            open.lane_index,
-        )
-        .await?
-    } else {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(false)
-            .open(&staging_path)
-            .await
-            .with_context(|| format!("failed opening staging file {}", staging_path.display()))?;
-        file.seek(SeekFrom::Start(resume_offset))
-            .await
-            .context("failed seeking staging file")?;
-        receive_lane_payload_to_file_pipelined(
-            &state,
-            &mut recv_stream,
-            file,
-            ReceiveLanePipelineArgs {
-                transfer_id: open.transfer_id,
-                striped,
-                checkpoint_path: checkpoint_path.clone(),
-                lane_index: open.lane_index,
-                resume_offset,
+        let expected_bytes = range_end_exclusive - resume_offset;
+        let stream_bytes_written = if discard_payload {
+            receive_lane_payload_no_disk(
+                &mut recv_stream,
                 expected_bytes,
-            },
-        )
-        .await?
-    };
-    lane_metrics.add_bytes(stream_bytes_written);
+                open.transfer_id,
+                open.lane_index,
+                payload_codec,
+            )
+            .await?
+        } else {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(false)
+                .open(&staging_path)
+                .await
+                .with_context(|| {
+                    format!("failed opening staging file {}", staging_path.display())
+                })?;
+            file.seek(SeekFrom::Start(resume_offset))
+                .await
+                .context("failed seeking staging file")?;
+            receive_lane_payload_to_file_pipelined(
+                &state,
+                &mut recv_stream,
+                file,
+                ReceiveLanePipelineArgs {
+                    transfer_id: open.transfer_id,
+                    striped,
+                    checkpoint_path: checkpoint_path.clone(),
+                    lane_index: open.lane_index,
+                    resume_offset,
+                    expected_bytes,
+                    payload_codec,
+                    receive_write_pipeline_depth,
+                },
+            )
+            .await?
+        };
+        lane_metrics.add_bytes(stream_bytes_written);
 
-    if striped && discard_payload {
-        persist_progress(
-            &state,
-            open.transfer_id,
-            true,
-            &checkpoint_path,
-            open.lane_index,
-            resume_offset + stream_bytes_written,
-        )
-        .await?;
-    }
+        if striped && discard_payload {
+            persist_progress(
+                &state,
+                open.transfer_id,
+                true,
+                &checkpoint_path,
+                open.lane_index,
+                resume_offset + stream_bytes_written,
+            )
+            .await?;
+        }
 
-    let complete = if striped {
-        finalize_if_ready(
-            &state,
-            open.transfer_id,
-            &staging_path,
-            &final_path,
-            &checkpoint_path,
-            discard_payload,
-        )
-        .await?
-    } else if discard_payload {
-        let bytes_received = resume_offset + stream_bytes_written;
-        finalize_single_lane_transfer_memory(&state, open.transfer_id, bytes_received).await?
-    } else {
-        let bytes_received = resume_offset + stream_bytes_written;
-        finalize_single_lane_transfer(
-            &state,
-            open.transfer_id,
-            bytes_received,
-            &staging_path,
-            &final_path,
-        )
-        .await?
-    };
-    lane_metrics.finish(complete.status);
-    if matches!(
-        complete.status,
-        TransferStatus::Completed | TransferStatus::Failed
-    ) {
-        if let Some(transfer_started_at) = take_transfer_started_at(&state, open.transfer_id).await
-        {
-            quic_metrics::record_transfer_finished(
-                total_lanes,
-                striped,
+        let complete = if striped {
+            finalize_if_ready(
+                &state,
+                open.transfer_id,
+                &staging_path,
+                &final_path,
+                &checkpoint_path,
                 discard_payload,
-                complete.status,
-                complete.bytes_transferred,
-                transfer_started_at.elapsed(),
+            )
+            .await?
+        } else if discard_payload {
+            let bytes_received = resume_offset + stream_bytes_written;
+            finalize_single_lane_transfer_memory(&state, open.transfer_id, bytes_received).await?
+        } else {
+            let bytes_received = resume_offset + stream_bytes_written;
+            finalize_single_lane_transfer(
+                &state,
+                open.transfer_id,
+                bytes_received,
+                &staging_path,
+                &final_path,
+            )
+            .await?
+        };
+        lane_metrics.finish(complete.status);
+        if matches!(
+            complete.status,
+            TransferStatus::Completed | TransferStatus::Failed
+        ) {
+            if let Some(transfer_started_at) =
+                take_transfer_started_at(&state, open.transfer_id).await
+            {
+                quic_metrics::record_transfer_finished(
+                    total_lanes,
+                    striped,
+                    discard_payload,
+                    complete.status,
+                    complete.bytes_transferred,
+                    transfer_started_at.elapsed(),
+                );
+            }
+        }
+
+        let complete_ack = QuicTransferCompleteAck {
+            ok: complete.status == TransferStatus::Completed,
+            status: complete.status,
+            bytes_received: complete.bytes_transferred,
+            message: complete.message,
+            updated_at: Utc::now(),
+        };
+        write_json_frame(&mut send_stream, &complete_ack).await?;
+        send_stream.finish()?;
+        info!(
+            peer = %peer,
+            transfer_id = %open.transfer_id,
+            lane = open.lane_index,
+            bytes_received = complete_ack.bytes_received,
+            status = ?complete_ack.status,
+            "transfer stream completed"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = stream_result {
+        if let Err(mark_err) = fail_running_transfer(&state, open.transfer_id).await {
+            warn!(
+                transfer_id = %open.transfer_id,
+                error = %mark_err,
+                "failed marking transfer as failed after stream error"
             );
         }
+        return Err(err);
     }
-
-    let complete_ack = QuicTransferCompleteAck {
-        ok: complete.status == TransferStatus::Completed,
-        status: complete.status,
-        bytes_received: complete.bytes_transferred,
-        message: complete.message,
-        updated_at: Utc::now(),
-    };
-    write_json_frame(&mut send_stream, &complete_ack).await?;
-    send_stream.finish()?;
-    info!(
-        peer = %peer,
-        transfer_id = %open.transfer_id,
-        lane = open.lane_index,
-        bytes_received = complete_ack.bytes_received,
-        status = ?complete_ack.status,
-        "transfer stream completed"
-    );
 
     Ok(())
 }
@@ -583,6 +669,8 @@ struct ReceiveLanePipelineArgs {
     lane_index: u32,
     resume_offset: u64,
     expected_bytes: u64,
+    payload_codec: PayloadCodec,
+    receive_write_pipeline_depth: usize,
 }
 
 async fn receive_lane_payload_no_disk(
@@ -590,29 +678,81 @@ async fn receive_lane_payload_no_disk(
     expected_bytes: u64,
     transfer_id: Uuid,
     lane_index: u32,
+    payload_codec: PayloadCodec,
 ) -> Result<u64> {
-    let mut stream_bytes_written = 0u64;
-    loop {
-        if stream_bytes_written >= expected_bytes {
-            break;
-        }
-        let next = recv_stream
-            .read_chunk(MAX_CHUNK_READ_BYTES, true)
+    async fn read_wire_payload_frame(
+        recv_stream: &mut quinn::RecvStream,
+        payload_codec: PayloadCodec,
+        transfer_id: Uuid,
+        lane_index: u32,
+    ) -> Result<(usize, [u8; 12], Vec<u8>)> {
+        let mut header = [0u8; APP_PAYLOAD_FRAME_HEADER_BYTES];
+        recv_stream.read_exact(&mut header).await.with_context(|| {
+            format!(
+                "failed reading payload frame header for transfer {} lane {}",
+                transfer_id, lane_index
+            )
+        })?;
+        let (plaintext_len, nonce) = decode_payload_frame_header(header)
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .with_context(|| {
+                format!(
+                    "invalid payload frame header for transfer {} lane {}",
+                    transfer_id, lane_index
+                )
+            })?;
+        let wire_len = app_payload_wire_len(payload_codec, plaintext_len)
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .with_context(|| {
+                format!(
+                    "invalid payload frame length for transfer {} lane {}",
+                    transfer_id, lane_index
+                )
+            })?;
+        let mut wire_payload = vec![0u8; wire_len];
+        recv_stream
+            .read_exact(&mut wire_payload)
             .await
-            .context("failed reading stream chunk")?;
-        let Some(chunk) = next else {
-            break;
-        };
+            .with_context(|| {
+                format!(
+                    "failed reading payload frame body for transfer {} lane {}",
+                    transfer_id, lane_index
+                )
+            })?;
+        Ok((plaintext_len, nonce, wire_payload))
+    }
+
+    let aead_codec = match payload_codec {
+        PayloadCodec::RawV1 => None,
+        PayloadCodec::AeadV1 => Some(AeadLaneCodec::new(transfer_id, lane_index)),
+    };
+    let mut stream_bytes_written = 0u64;
+    while stream_bytes_written < expected_bytes {
+        let (plaintext_len, nonce, wire_payload) =
+            read_wire_payload_frame(recv_stream, payload_codec, transfer_id, lane_index).await?;
         let remaining = expected_bytes - stream_bytes_written;
-        let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
-        if to_write < chunk.bytes.len() {
+        if plaintext_len as u64 > remaining {
             bail!(
                 "received lane payload overflow for transfer {} lane {}",
                 transfer_id,
                 lane_index
             );
         }
-        stream_bytes_written += to_write as u64;
+        let plaintext = decode_payload_frame(
+            payload_codec,
+            plaintext_len,
+            nonce,
+            &wire_payload,
+            aead_codec.as_ref(),
+        )
+        .map_err(|msg| anyhow::anyhow!(msg))
+        .with_context(|| {
+            format!(
+                "failed decoding payload frame for transfer {} lane {}",
+                transfer_id, lane_index
+            )
+        })?;
+        stream_bytes_written += plaintext.len() as u64;
     }
     if stream_bytes_written != expected_bytes {
         bail!(
@@ -633,36 +773,71 @@ async fn receive_lane_payload_to_file_pipelined(
     args: ReceiveLanePipelineArgs,
 ) -> Result<u64> {
     #[derive(Debug)]
+    struct ReceiveWireFrame {
+        plaintext_len: usize,
+        nonce: [u8; 12],
+        wire_payload: Vec<u8>,
+    }
+
+    #[derive(Debug)]
     struct ReceivePipelineChunk {
         buffer: Vec<u8>,
         bytes_read: usize,
     }
 
-    fn decrypt_payload_chunk_in_place(_payload: &mut [u8]) {
-        // QUIC already decrypts payload; keep a dedicated stage so app-level
-        // crypto/FEC transforms can be inserted without restructuring the pipeline.
-    }
-
-    let (buffer_pool_tx, mut buffer_pool_rx) =
-        mpsc::channel::<Vec<u8>>(RECEIVE_WRITE_PIPELINE_DEPTH);
-    for _ in 0..RECEIVE_WRITE_PIPELINE_DEPTH {
-        buffer_pool_tx
-            .send(vec![0u8; MAX_CHUNK_READ_BYTES])
+    async fn read_wire_payload_frame(
+        recv_stream: &mut quinn::RecvStream,
+        payload_codec: PayloadCodec,
+        transfer_id: Uuid,
+        lane_index: u32,
+    ) -> Result<(usize, [u8; 12], Vec<u8>)> {
+        let mut header = [0u8; APP_PAYLOAD_FRAME_HEADER_BYTES];
+        recv_stream.read_exact(&mut header).await.with_context(|| {
+            format!(
+                "failed reading payload frame header for transfer {} lane {}",
+                transfer_id, lane_index
+            )
+        })?;
+        let (plaintext_len, nonce) = decode_payload_frame_header(header)
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .with_context(|| {
+                format!(
+                    "invalid payload frame header for transfer {} lane {}",
+                    transfer_id, lane_index
+                )
+            })?;
+        let wire_len = app_payload_wire_len(payload_codec, plaintext_len)
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .with_context(|| {
+                format!(
+                    "invalid payload frame length for transfer {} lane {}",
+                    transfer_id, lane_index
+                )
+            })?;
+        let mut wire_payload = vec![0u8; wire_len];
+        recv_stream
+            .read_exact(&mut wire_payload)
             .await
-            .map_err(|_| anyhow::anyhow!("failed seeding receive/write pipeline buffers"))?;
+            .with_context(|| {
+                format!(
+                    "failed reading payload frame body for transfer {} lane {}",
+                    transfer_id, lane_index
+                )
+            })?;
+        Ok((plaintext_len, nonce, wire_payload))
     }
 
-    let (decrypt_tx, mut decrypt_rx) =
-        mpsc::channel::<ReceivePipelineChunk>(RECEIVE_WRITE_PIPELINE_DEPTH);
-    let (writer_tx, mut writer_rx) =
-        mpsc::channel::<ReceivePipelineChunk>(RECEIVE_WRITE_PIPELINE_DEPTH);
+    let pipeline_depth = normalize_receive_write_pipeline_depth(args.receive_write_pipeline_depth);
+    let (decrypt_tx, mut decrypt_rx) = mpsc::channel::<ReceiveWireFrame>(pipeline_depth);
+    let (writer_tx, mut writer_rx) = mpsc::channel::<ReceivePipelineChunk>(pipeline_depth);
 
     let state_for_writer = state.clone();
     let writer_args = args.clone();
-    let buffer_pool_tx_for_writer = buffer_pool_tx.clone();
+    let decrypt_args = args.clone();
     let writer_task = tokio::spawn(async move {
         let mut bytes_written = 0u64;
         let mut since_update = 0u64;
+        let mut last_durable_offset = writer_args.resume_offset;
         while let Some(chunk) = writer_rx.recv().await {
             file.write_all(&chunk.buffer[..chunk.bytes_read])
                 .await
@@ -670,9 +845,11 @@ async fn receive_lane_payload_to_file_pipelined(
             let chunk_len = chunk.bytes_read as u64;
             bytes_written += chunk_len;
             since_update += chunk_len;
-            let _ = buffer_pool_tx_for_writer.try_send(chunk.buffer);
 
             if since_update >= PROGRESS_UPDATE_INTERVAL_BYTES {
+                file.sync_data()
+                    .await
+                    .context("failed syncing transfer file before checkpoint update")?;
                 persist_progress(
                     &state_for_writer,
                     writer_args.transfer_id,
@@ -682,17 +859,22 @@ async fn receive_lane_payload_to_file_pipelined(
                     writer_args.resume_offset + bytes_written,
                 )
                 .await?;
+                last_durable_offset = writer_args.resume_offset + bytes_written;
                 since_update = 0;
             }
         }
-        if since_update > 0 {
+        let final_offset = writer_args.resume_offset + bytes_written;
+        if final_offset > last_durable_offset {
+            file.sync_data()
+                .await
+                .context("failed syncing transfer file before final checkpoint update")?;
             persist_progress(
                 &state_for_writer,
                 writer_args.transfer_id,
                 writer_args.striped,
                 &writer_args.checkpoint_path,
                 writer_args.lane_index,
-                writer_args.resume_offset + bytes_written,
+                final_offset,
             )
             .await?;
         }
@@ -702,11 +884,35 @@ async fn receive_lane_payload_to_file_pipelined(
         Ok::<u64, anyhow::Error>(bytes_written)
     });
 
+    let payload_codec = args.payload_codec;
     let decrypt_task = tokio::spawn(async move {
-        while let Some(mut chunk) = decrypt_rx.recv().await {
-            decrypt_payload_chunk_in_place(&mut chunk.buffer[..chunk.bytes_read]);
+        let aead_codec = match payload_codec {
+            PayloadCodec::RawV1 => None,
+            PayloadCodec::AeadV1 => Some(AeadLaneCodec::new(
+                decrypt_args.transfer_id,
+                decrypt_args.lane_index,
+            )),
+        };
+        while let Some(frame) = decrypt_rx.recv().await {
+            let plaintext = decode_payload_frame(
+                payload_codec,
+                frame.plaintext_len,
+                frame.nonce,
+                &frame.wire_payload,
+                aead_codec.as_ref(),
+            )
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .with_context(|| {
+                format!(
+                    "failed decoding payload frame for transfer {} lane {}",
+                    decrypt_args.transfer_id, decrypt_args.lane_index
+                )
+            })?;
             writer_tx
-                .send(chunk)
+                .send(ReceivePipelineChunk {
+                    bytes_read: plaintext.len(),
+                    buffer: plaintext,
+                })
                 .await
                 .map_err(|_| anyhow::anyhow!("writer stage channel unexpectedly closed"))?;
         }
@@ -716,19 +922,22 @@ async fn receive_lane_payload_to_file_pipelined(
     let mut bytes_received = 0u64;
     let mut read_error: Option<anyhow::Error> = None;
     while bytes_received < args.expected_bytes {
-        let next = match recv_stream.read_chunk(MAX_CHUNK_READ_BYTES, true).await {
-            Ok(next) => next,
+        let (plaintext_len, nonce, wire_payload) = match read_wire_payload_frame(
+            recv_stream,
+            args.payload_codec,
+            args.transfer_id,
+            args.lane_index,
+        )
+        .await
+        {
+            Ok(frame) => frame,
             Err(err) => {
-                read_error = Some(anyhow::Error::new(err).context("failed reading stream chunk"));
+                read_error = Some(err);
                 break;
             }
         };
-        let Some(chunk) = next else {
-            break;
-        };
         let remaining = args.expected_bytes - bytes_received;
-        let to_write = remaining.min(chunk.bytes.len() as u64) as usize;
-        if to_write < chunk.bytes.len() {
+        if plaintext_len as u64 > remaining {
             read_error = Some(anyhow::anyhow!(
                 "received lane payload overflow for transfer {} lane {}",
                 args.transfer_id,
@@ -737,26 +946,11 @@ async fn receive_lane_payload_to_file_pipelined(
             break;
         }
 
-        let mut buffer = match buffer_pool_rx.recv().await {
-            Some(buffer) => buffer,
-            None => {
-                read_error = Some(anyhow::anyhow!(
-                    "receive buffer pool unexpectedly closed for transfer {} lane {}",
-                    args.transfer_id,
-                    args.lane_index
-                ));
-                break;
-            }
-        };
-        if buffer.len() < to_write {
-            buffer.resize(to_write, 0);
-        }
-        buffer[..to_write].copy_from_slice(&chunk.bytes[..to_write]);
-
         if decrypt_tx
-            .send(ReceivePipelineChunk {
-                buffer,
-                bytes_read: to_write,
+            .send(ReceiveWireFrame {
+                plaintext_len,
+                nonce,
+                wire_payload,
             })
             .await
             .is_err()
@@ -768,7 +962,7 @@ async fn receive_lane_payload_to_file_pipelined(
             ));
             break;
         }
-        bytes_received += to_write as u64;
+        bytes_received += plaintext_len as u64;
     }
 
     drop(decrypt_tx);
@@ -821,7 +1015,8 @@ async fn persist_progress(
     new_offset: u64,
 ) -> Result<()> {
     let bytes = if striped {
-        update_checkpoint_offset(state, checkpoint_path, lane_index, new_offset).await?
+        update_checkpoint_offset(state, checkpoint_path, transfer_id, lane_index, new_offset)
+            .await?
     } else {
         new_offset
     };
@@ -829,6 +1024,17 @@ async fn persist_progress(
     if let Some(transfer) = transfers.get_mut(&transfer_id) {
         transfer.bytes_transferred = bytes.min(transfer.file_size_bytes);
         transfer.updated_at = Utc::now();
+    }
+    Ok(())
+}
+
+async fn persist_transfer_summary(state: &AppState, transfer_id: Uuid) -> Result<()> {
+    let snapshot: Option<TransferSummary> = {
+        let transfers = state.transfers.read().await;
+        transfers.get(&transfer_id).cloned()
+    };
+    if let Some(summary) = snapshot {
+        state.transfer_store.upsert(&summary).await?;
     }
     Ok(())
 }
@@ -846,22 +1052,30 @@ async fn finalize_single_lane_transfer(
     staging_path: &Path,
     final_path: &Path,
 ) -> Result<FinalizeResult> {
-    let mut transfers = state.transfers.write().await;
-    let transfer = transfers
-        .get_mut(&transfer_id)
-        .with_context(|| format!("unknown transfer_id {transfer_id}"))?;
+    let file_size = {
+        let mut transfers = state.transfers.write().await;
+        let transfer = transfers
+            .get_mut(&transfer_id)
+            .with_context(|| format!("unknown transfer_id {transfer_id}"))?;
+        transfer.bytes_transferred = bytes_received.min(transfer.file_size_bytes);
+        transfer.updated_at = Utc::now();
+        transfer.file_size_bytes
+    };
 
-    transfer.bytes_transferred = bytes_received.min(transfer.file_size_bytes);
-    transfer.updated_at = Utc::now();
-
-    if bytes_received != transfer.file_size_bytes {
-        transfer.status = TransferStatus::Failed;
+    if bytes_received != file_size {
+        set_transfer_status(
+            state,
+            transfer_id,
+            TransferStatus::Failed,
+            bytes_received.min(file_size),
+        )
+        .await?;
         return Ok(FinalizeResult {
             status: TransferStatus::Failed,
-            bytes_transferred: transfer.bytes_transferred,
+            bytes_transferred: bytes_received.min(file_size),
             message: format!(
                 "incomplete stream: received {bytes_received} bytes, expected {}",
-                transfer.file_size_bytes
+                file_size
             ),
         });
     }
@@ -874,30 +1088,44 @@ async fn finalize_single_lane_transfer_memory(
     transfer_id: Uuid,
     bytes_received: u64,
 ) -> Result<FinalizeResult> {
-    let mut transfers = state.transfers.write().await;
-    let transfer = transfers
-        .get_mut(&transfer_id)
-        .with_context(|| format!("unknown transfer_id {transfer_id}"))?;
+    let file_size = {
+        let mut transfers = state.transfers.write().await;
+        let transfer = transfers
+            .get_mut(&transfer_id)
+            .with_context(|| format!("unknown transfer_id {transfer_id}"))?;
+        transfer.bytes_transferred = bytes_received.min(transfer.file_size_bytes);
+        transfer.updated_at = Utc::now();
+        transfer.file_size_bytes
+    };
 
-    transfer.bytes_transferred = bytes_received.min(transfer.file_size_bytes);
-    transfer.updated_at = Utc::now();
-
-    if bytes_received != transfer.file_size_bytes {
-        transfer.status = TransferStatus::Failed;
+    if bytes_received != file_size {
+        set_transfer_status(
+            state,
+            transfer_id,
+            TransferStatus::Failed,
+            bytes_received.min(file_size),
+        )
+        .await?;
         return Ok(FinalizeResult {
             status: TransferStatus::Failed,
-            bytes_transferred: transfer.bytes_transferred,
+            bytes_transferred: bytes_received.min(file_size),
             message: format!(
                 "incomplete stream: received {bytes_received} bytes, expected {}",
-                transfer.file_size_bytes
+                file_size
             ),
         });
     }
 
-    transfer.status = TransferStatus::Completed;
+    set_transfer_status(
+        state,
+        transfer_id,
+        TransferStatus::Completed,
+        bytes_received.min(file_size),
+    )
+    .await?;
     Ok(FinalizeResult {
         status: TransferStatus::Completed,
-        bytes_transferred: transfer.bytes_transferred,
+        bytes_transferred: bytes_received.min(file_size),
         message: "transfer finalized in null sink mode".to_owned(),
     })
 }
@@ -910,7 +1138,8 @@ async fn finalize_if_ready(
     checkpoint_path: &Path,
     discard_payload: bool,
 ) -> Result<FinalizeResult> {
-    let _finalize_guard = state.finalize_lock.lock().await;
+    let finalize_lock = state.finalize_lock_for(transfer_id);
+    let _finalize_guard = finalize_lock.lock().await;
 
     let (already_done, bytes_transferred) = {
         let transfers = state.transfers.read().await;
@@ -930,10 +1159,10 @@ async fn finalize_if_ready(
         });
     }
 
-    let checkpoint = load_checkpoint(state, checkpoint_path).await?;
+    let checkpoint = load_checkpoint(state, checkpoint_path, transfer_id).await?;
     let total = checkpoint.total_transferred();
     if !checkpoint.all_lanes_complete() {
-        set_transfer_status(state, transfer_id, TransferStatus::Running, total).await;
+        set_transfer_status(state, transfer_id, TransferStatus::Running, total).await?;
         return Ok(FinalizeResult {
             status: TransferStatus::Running,
             bytes_transferred: total,
@@ -942,7 +1171,7 @@ async fn finalize_if_ready(
     }
 
     let finalized = if discard_payload {
-        set_transfer_status(state, transfer_id, TransferStatus::Completed, total).await;
+        set_transfer_status(state, transfer_id, TransferStatus::Completed, total).await?;
         FinalizeResult {
             status: TransferStatus::Completed,
             bytes_transferred: total,
@@ -986,7 +1215,7 @@ async fn finalize_transfer_on_disk(
             TransferStatus::Failed,
             bytes_transferred,
         )
-        .await;
+        .await?;
         return Ok(FinalizeResult {
             status: TransferStatus::Failed,
             bytes_transferred,
@@ -1004,7 +1233,7 @@ async fn finalize_transfer_on_disk(
             TransferStatus::Failed,
             bytes_transferred,
         )
-        .await;
+        .await?;
         return Ok(FinalizeResult {
             status: TransferStatus::Failed,
             bytes_transferred,
@@ -1037,7 +1266,7 @@ async fn finalize_transfer_on_disk(
         TransferStatus::Completed,
         bytes_transferred,
     )
-    .await;
+    .await?;
 
     Ok(FinalizeResult {
         status: TransferStatus::Completed,
@@ -1051,13 +1280,41 @@ async fn set_transfer_status(
     transfer_id: Uuid,
     status: TransferStatus,
     bytes_transferred: u64,
-) {
+) -> Result<()> {
+    let mut terminal = false;
     let mut transfers = state.transfers.write().await;
     if let Some(transfer) = transfers.get_mut(&transfer_id) {
         transfer.status = status;
         transfer.bytes_transferred = bytes_transferred.min(transfer.file_size_bytes);
         transfer.updated_at = Utc::now();
+        terminal = matches!(status, TransferStatus::Completed | TransferStatus::Failed);
     }
+    drop(transfers);
+    persist_transfer_summary(state, transfer_id).await?;
+    if terminal {
+        state.clear_transfer_locks(transfer_id);
+    }
+    Ok(())
+}
+
+async fn fail_running_transfer(state: &AppState, transfer_id: Uuid) -> Result<()> {
+    let bytes_transferred = {
+        let transfers = state.transfers.read().await;
+        let Some(transfer) = transfers.get(&transfer_id) else {
+            return Ok(());
+        };
+        if transfer.status != TransferStatus::Running {
+            return Ok(());
+        }
+        transfer.bytes_transferred
+    };
+    set_transfer_status(
+        state,
+        transfer_id,
+        TransferStatus::Failed,
+        bytes_transferred,
+    )
+    .await
 }
 
 async fn load_or_init_lane_resume(
@@ -1070,7 +1327,8 @@ async fn load_or_init_lane_resume(
     range_start: u64,
     range_end_exclusive: u64,
 ) -> Result<(u64, u64)> {
-    let _guard = state.checkpoint_lock.lock().await;
+    let checkpoint_lock = state.checkpoint_lock_for(transfer_id);
+    let _guard = checkpoint_lock.lock().await;
     let mut checkpoint = if fs::try_exists(checkpoint_path).await? {
         load_checkpoint_unlocked(checkpoint_path).await?
     } else {
@@ -1089,9 +1347,7 @@ async fn load_or_init_lane_resume(
     let lane = checkpoint
         .lane_mut(lane_index)
         .with_context(|| format!("missing lane {lane_index} in checkpoint"))?;
-    lane.offset = lane
-        .offset
-        .clamp(lane.range_start, lane.range_end_exclusive);
+    lane.offset = durable_resume_offset(lane.offset, lane.range_start, lane.range_end_exclusive);
     let resume = lane.offset;
     let total = checkpoint.total_transferred();
     persist_checkpoint_unlocked(checkpoint_path, &checkpoint).await?;
@@ -1101,22 +1357,31 @@ async fn load_or_init_lane_resume(
 async fn update_checkpoint_offset(
     state: &AppState,
     checkpoint_path: &Path,
+    transfer_id: Uuid,
     lane_index: u32,
     new_offset: u64,
 ) -> Result<u64> {
-    let _guard = state.checkpoint_lock.lock().await;
+    let checkpoint_lock = state.checkpoint_lock_for(transfer_id);
+    let _guard = checkpoint_lock.lock().await;
     let mut checkpoint = load_checkpoint_unlocked(checkpoint_path).await?;
     let lane = checkpoint
         .lane_mut(lane_index)
         .with_context(|| format!("missing lane {lane_index} in checkpoint"))?;
-    lane.offset = new_offset.clamp(lane.range_start, lane.range_end_exclusive);
+    let durable_offset =
+        durable_resume_offset(new_offset, lane.range_start, lane.range_end_exclusive);
+    lane.offset = lane.offset.max(durable_offset);
     let total = checkpoint.total_transferred();
     persist_checkpoint_unlocked(checkpoint_path, &checkpoint).await?;
     Ok(total)
 }
 
-async fn load_checkpoint(state: &AppState, checkpoint_path: &Path) -> Result<TransferCheckpoint> {
-    let _guard = state.checkpoint_lock.lock().await;
+async fn load_checkpoint(
+    state: &AppState,
+    checkpoint_path: &Path,
+    transfer_id: Uuid,
+) -> Result<TransferCheckpoint> {
+    let checkpoint_lock = state.checkpoint_lock_for(transfer_id);
+    let _guard = checkpoint_lock.lock().await;
     load_checkpoint_unlocked(checkpoint_path).await
 }
 
@@ -1141,12 +1406,81 @@ async fn persist_checkpoint_unlocked(
 ) -> Result<()> {
     let json =
         serde_json::to_vec_pretty(checkpoint).context("failed serializing checkpoint JSON")?;
-    fs::write(checkpoint_path, json).await.with_context(|| {
+    let parent = checkpoint_path.parent().with_context(|| {
         format!(
-            "failed writing checkpoint file {}",
+            "checkpoint path missing parent directory: {}",
             checkpoint_path.display()
         )
-    })
+    })?;
+    fs::create_dir_all(parent).await.with_context(|| {
+        format!(
+            "failed creating checkpoint parent directory {}",
+            parent.display()
+        )
+    })?;
+
+    let file_name = checkpoint_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint");
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    let mut tmp = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed creating checkpoint temp file {}",
+                tmp_path.display()
+            )
+        })?;
+    tmp.write_all(&json)
+        .await
+        .with_context(|| format!("failed writing checkpoint temp file {}", tmp_path.display()))?;
+    tmp.flush().await.with_context(|| {
+        format!(
+            "failed flushing checkpoint temp file {}",
+            tmp_path.display()
+        )
+    })?;
+    tmp.sync_data()
+        .await
+        .with_context(|| format!("failed syncing checkpoint temp file {}", tmp_path.display()))?;
+    drop(tmp);
+
+    fs::rename(&tmp_path, checkpoint_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed atomically replacing checkpoint {} from {}",
+                checkpoint_path.display(),
+                tmp_path.display()
+            )
+        })?;
+    sync_directory(parent).await?;
+    Ok(())
+}
+
+async fn sync_directory(path: &Path) -> Result<()> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .with_context(|| format!("failed opening directory for sync {}", path.display()))?;
+    dir.sync_data()
+        .await
+        .with_context(|| format!("failed syncing directory metadata {}", path.display()))
+}
+
+fn durable_resume_offset(offset: u64, range_start: u64, range_end_exclusive: u64) -> u64 {
+    let clamped = offset.clamp(range_start, range_end_exclusive);
+    if clamped >= range_end_exclusive {
+        return range_end_exclusive;
+    }
+    let aligned = clamped - (clamped % RESUME_CHUNK_SIZE_BYTES);
+    aligned.clamp(range_start, range_end_exclusive)
 }
 
 fn checkpoint_path_for(tenant_dir: &Path, transfer_id: Uuid) -> PathBuf {
@@ -1187,4 +1521,31 @@ fn split_ranges(file_size_bytes: u64, lanes: u32) -> Vec<(u64, u64)> {
         start = end;
     }
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RESUME_CHUNK_SIZE_BYTES, durable_resume_offset};
+
+    #[test]
+    fn durable_resume_offset_aligns_to_resume_chunk_boundary() {
+        let offset = (3 * RESUME_CHUNK_SIZE_BYTES) + (RESUME_CHUNK_SIZE_BYTES / 2);
+        let aligned = durable_resume_offset(offset, 0, 10 * RESUME_CHUNK_SIZE_BYTES);
+        assert_eq!(aligned, 3 * RESUME_CHUNK_SIZE_BYTES);
+    }
+
+    #[test]
+    fn durable_resume_offset_preserves_lane_end_even_if_unaligned() {
+        let range_end = (3 * RESUME_CHUNK_SIZE_BYTES) + 123;
+        let aligned = durable_resume_offset(range_end, 0, range_end);
+        assert_eq!(aligned, range_end);
+    }
+
+    #[test]
+    fn durable_resume_offset_clamps_to_lane_start_for_mid_chunk_ranges() {
+        let range_start = (2 * RESUME_CHUNK_SIZE_BYTES) + 17;
+        let offset = range_start + 512;
+        let aligned = durable_resume_offset(offset, range_start, 6 * RESUME_CHUNK_SIZE_BYTES);
+        assert_eq!(aligned, range_start);
+    }
 }

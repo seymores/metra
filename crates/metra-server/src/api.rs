@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -16,6 +16,8 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 type ApiResult<T> = std::result::Result<T, (StatusCode, Json<ErrorResponse>)>;
+const CONTROL_PLANE_BODY_MAX_BYTES: usize = 64 * 1024;
+const MAX_TRACKED_TRANSFERS: usize = 1_024;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -24,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/transfers", post(create_transfer))
         .route("/v1/transfers/{transfer_id}", get(get_transfer))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(CONTROL_PLANE_BODY_MAX_BYTES))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -79,7 +82,38 @@ async fn create_transfer(
         updated_at: now,
     };
 
-    state.transfers.write().await.insert(transfer_id, summary);
+    {
+        let mut transfers = state.transfers.write().await;
+        let active_transfers = transfers
+            .values()
+            .filter(|transfer| {
+                matches!(
+                    transfer.status,
+                    TransferStatus::Queued | TransferStatus::Running
+                )
+            })
+            .count();
+        if active_transfers >= MAX_TRACKED_TRANSFERS {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    code: "transfer_limit_reached".to_owned(),
+                    message: format!(
+                        "server is at capacity (max {} active transfers)",
+                        MAX_TRACKED_TRANSFERS
+                    ),
+                }),
+            ));
+        }
+        transfers.insert(transfer_id, summary.clone());
+    }
+    if let Err(err) = state.transfer_store.upsert(&summary).await {
+        state.transfers.write().await.remove(&transfer_id);
+        return Err(internal_error(format!(
+            "failed persisting transfer {}: {}",
+            transfer_id, err
+        )));
+    }
     info!(transfer_id = %transfer_id, "transfer accepted");
 
     Ok((
@@ -91,6 +125,16 @@ async fn create_transfer(
             resume_chunk_size_bytes: payload.resume_chunk_size_bytes,
         }),
     ))
+}
+
+fn internal_error(message: String) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            code: "internal_error".to_owned(),
+            message,
+        }),
+    )
 }
 
 async fn get_transfer(

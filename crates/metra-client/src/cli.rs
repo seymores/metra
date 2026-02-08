@@ -141,22 +141,38 @@ impl Default for TuiArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct SendArgs {
-    #[arg(long)]
-    pub transfer_id: Uuid,
-    #[arg(long)]
+    #[arg(value_name = "FILE_PATH")]
     pub file_path: PathBuf,
+    #[arg(value_name = "DESTINATION", required_unless_present = "transfer_id")]
+    pub destination: Option<String>,
+    #[arg(long)]
+    pub transfer_id: Option<Uuid>,
+    #[arg(long)]
+    pub tenant_id: Option<String>,
+    #[arg(long)]
+    pub user_id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub overwrite: bool,
+    #[arg(long, default_value_t = false)]
+    pub immutable_destination: bool,
     #[arg(long)]
     pub quic_addr: Option<SocketAddr>,
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     pub io_chunk_bytes: usize,
     #[arg(long, default_value_t = 1)]
     pub progress_interval_secs: u64,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 2)]
     pub lanes: u32,
+    #[arg(long)]
+    pub auto_lanes_report: Option<PathBuf>,
+    #[arg(long)]
+    pub lane_policy: Option<PathBuf>,
     #[arg(long)]
     pub auto_runtime_report: Option<PathBuf>,
     #[arg(long)]
     pub runtime_policy: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy_out: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub runtime_profile: Option<RuntimeProfile>,
     #[arg(long)]
@@ -191,6 +207,8 @@ pub struct BenchArgs {
     pub auto_runtime_report: Option<PathBuf>,
     #[arg(long)]
     pub runtime_policy: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy_out: Option<PathBuf>,
     #[arg(long, value_enum)]
     pub runtime_profile: Option<RuntimeProfile>,
     #[arg(long)]
@@ -263,7 +281,7 @@ pub struct TuneRuntimeArgs {
     pub iterations: u32,
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     pub io_chunk_bytes: usize,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     pub no_disk: bool,
     #[arg(long, default_value = "/tmp/metra-tune-runtime.bin")]
     pub file_path: PathBuf,
@@ -307,6 +325,16 @@ pub struct CompareArgs {
     pub lanes: u32,
     #[arg(long, default_value_t = 3)]
     pub iterations: u32,
+    #[arg(long)]
+    pub auto_runtime_report: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy_out: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub runtime_profile: Option<RuntimeProfile>,
+    #[arg(long)]
+    pub file_read_pipeline_depth: Option<usize>,
     #[arg(long, default_value_t = true)]
     pub cleanup_file: bool,
     #[arg(long)]
@@ -335,6 +363,16 @@ pub struct CompareSeriesArgs {
     pub lanes: u32,
     #[arg(long, default_value_t = 3)]
     pub iterations: u32,
+    #[arg(long)]
+    pub auto_runtime_report: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy: Option<PathBuf>,
+    #[arg(long)]
+    pub runtime_policy_out: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub runtime_profile: Option<RuntimeProfile>,
+    #[arg(long)]
+    pub file_read_pipeline_depth: Option<usize>,
     #[arg(long, default_value_t = true)]
     pub cleanup_files: bool,
     #[arg(long)]
@@ -353,7 +391,7 @@ pub struct TuneLanesArgs {
     pub iterations: u32,
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     pub io_chunk_bytes: usize,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     pub no_disk: bool,
     #[arg(long, default_value = "/tmp/metra-tune-lanes.bin")]
     pub file_path: PathBuf,

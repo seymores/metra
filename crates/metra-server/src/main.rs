@@ -5,6 +5,7 @@ mod quic_metrics;
 mod signal;
 mod state;
 mod telemetry;
+mod transfer_store;
 mod wire;
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::{args::Args, state::AppState};
+use crate::{args::Args, state::AppState, transfer_store::TransferStore};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,12 +32,22 @@ async fn main() -> Result<()> {
 
     let (endpoint, cert_der) =
         quic::build_quic_endpoint(args.quic_addr, &args.quic_server_name, args.quic_profile)?;
+    let transfer_store_path = args.data_dir.join("metra-transfers.sqlite");
+    let transfer_store = TransferStore::open(transfer_store_path.clone())?;
+    let persisted_transfers = transfer_store.load_all().await?;
+    info!(
+        store = %transfer_store_path.display(),
+        transfers_loaded = persisted_transfers.len(),
+        "loaded persisted transfers"
+    );
     let app_state = AppState::new(
         args.quic_addr,
         args.data_dir.clone(),
         args.quic_server_name.clone(),
         args.quic_profile.to_string(),
         BASE64.encode(cert_der),
+        transfer_store,
+        persisted_transfers,
     );
 
     let shutdown = CancellationToken::new();

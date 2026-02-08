@@ -59,6 +59,21 @@ jobs:
             --report /tmp/metra-reports/tune-runtime-ci.json \
             --baseline ci/benchmark-baseline.json
 
+      - name: Run runtime tuning benchmark (disk path)
+        run: |
+          target/release/metra-client --server http://127.0.0.1:8080 --output json transfer tune-runtime \
+            --size-gib 1 \
+            --lanes 2 \
+            --iterations 1 \
+            --io-chunk-bytes 8388608 \
+            --json-out /tmp/metra-reports/tune-runtime-ci-disk.json
+
+      - name: Check runtime profile disk-path regression gate
+        run: |
+          python3 scripts/ci/benchmark_gate.py \
+            --report /tmp/metra-reports/tune-runtime-ci-disk.json \
+            --baseline ci/benchmark-disk-baseline.json
+
       - name: Run lane tuning benchmark
         run: |
           target/release/metra-client --server http://127.0.0.1:8080 --output json transfer tune-lanes \

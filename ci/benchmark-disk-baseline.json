@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "description": "Localhost disk-backed staged-pipeline tune-runtime baseline for CI regression gating (p50 + p95 + completion-rate).",
+  "default_max_regression_percent": 35.0,
+  "default_min_success_rate": 0.9,
+  "profiles": {
+    "balanced": {
+      "baseline_p50_gbps": 0.1,
+      "baseline_p95_gbps": 0.1,
+      "min_success_rate": 0.9
+    },
+    "throughput": {
+      "baseline_p50_gbps": 0.1,
+      "baseline_p95_gbps": 0.1,
+      "min_success_rate": 0.9
+    },
+    "low-cpu": {
+      "baseline_p50_gbps": 0.1,
+      "baseline_p95_gbps": 0.1,
+      "min_success_rate": 0.9
+    }
+  }
+}

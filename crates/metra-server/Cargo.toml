@@ -17,6 +17,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
+rusqlite.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -112,6 +112,7 @@ async fn run_benchmark_in_state(state: &mut TuiState, http: &Client, server: &st
         lane_policy: None,
         auto_runtime_report: args.auto_runtime_report.clone(),
         runtime_policy: args.runtime_policy.clone(),
+        runtime_policy_out: None,
         runtime_profile: None,
         file_read_pipeline_depth: None,
     };
